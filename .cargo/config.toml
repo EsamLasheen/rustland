@@ -1,0 +1,3 @@
+[target.x86_64-pc-windows-msvc]
+# The end user should not need to install a Visual C++ runtime for this app.
+rustflags = ["-C", "target-feature=+crt-static"]

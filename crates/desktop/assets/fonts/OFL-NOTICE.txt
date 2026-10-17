@@ -1,0 +1,5 @@
+﻿Bundled fonts (all under the SIL Open Font License 1.1, https://openfontlicense.org):
+- Rajdhani (Bold, SemiBold) - Indian Type Foundry
+- Alexandria - Mohamed Gaber, Julieta Ulanovsky
+- Reem Kufi - Khaled Hosny, Santiago Orozco
+They are embedded in the executable and loaded privately (not installed system-wide).
