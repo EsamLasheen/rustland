@@ -1005,7 +1005,7 @@ fn dpapi(data: &[u8], protect: bool) -> Option<Vec<u8>> {
         let ok = if protect {
             CryptProtectData(
                 &input,
-                w!("Monarch Next Gemini key"),
+                w!("Solo Leveling Shell Gemini key"),
                 None,
                 None,
                 None,

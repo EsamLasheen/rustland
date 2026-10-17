@@ -53,7 +53,7 @@ pub fn run() -> std::io::Result<()> {
         if status.code() == Some(FATAL_EXIT) {
             crate::taskbar::restore_after_crash();
             return Err(std::io::Error::other(
-                "Monarch Next could not start. Details are in session.log.",
+                "Solo Leveling Shell could not start. Details are in session.log.",
             ));
         }
         let now = Instant::now();
@@ -67,7 +67,7 @@ pub fn run() -> std::io::Result<()> {
             // give the desktop back rather than crash-looping
             crate::taskbar::restore_after_crash();
             return Err(std::io::Error::other(
-                "Monarch Next stopped after repeated crashes. Details are in session.log.",
+                "Solo Leveling Shell stopped after repeated crashes. Details are in session.log.",
             ));
         }
         std::thread::sleep(Duration::from_millis(500 * crashes.len() as u64));

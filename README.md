@@ -1,12 +1,13 @@
-# Monarch Next
+# Solo Leveling Shell
+
+> Built on **[NibrasShell](https://github.com/AhmedSaadi0/NibrasShell) by [Ahmed Saadi](https://github.com/AhmedSaadi0)** —
+> its design, layout and interaction model (top bar, smart capsule, left bar, floating panels),
+> brought to Windows 11 with a *Solo Leveling* (Shadow Monarch) theme.
 
 A complete Windows 11 desktop shell in **pure Rust**: top bar, smart capsule, side panels, tiling
 window manager, wallpaper engine, system tray, launcher and a Gemini assistant — in **one 2.6 MB
 executable** with no runtime dependencies (no browser engine, no WebView, no Node, no local server,
-no helper programs).
-
-The look follows the *Shadow Monarch* (Solo Leveling) theme and the layout of
-[NibrasShell](https://github.com/AhmedSaadi0/NibrasShell). Arabic and English are both first-class.
+no helper programs). Arabic and English are both first-class.
 
 <p>
 <img src="docs/screenshots/topbar.png" alt="Top bar">
@@ -36,14 +37,14 @@ The look follows the *Shadow Monarch* (Solo Leveling) theme and the layout of
 
 ## Install
 
-1. Download `MonarchNext-Setup.exe` from the [Releases](../../releases) page.
+1. Download `SoloLevelingShell-Setup.exe` from the [Releases](../../releases) page.
 2. Run it. A short setup asks for your name, your wallpapers folder, your city (for weather), an
    optional Obsidian focus-timer file, your rank colour, and which parts to enable (window tiling,
    hiding the taskbar, wallpaper engine, start with Windows).
 3. Done — the shell starts. No administrator rights needed. Everything can be changed later from
    the Settings panel; running the setup again updates in place and keeps your settings.
 
-Uninstall from *Settings → Apps → Monarch Next*; the Windows taskbar comes back as it was.
+Uninstall from *Settings → Apps → Solo Leveling Shell*; the Windows taskbar comes back as it was.
 
 Quick start in Arabic: [QUICKSTART-AR.md](QUICKSTART-AR.md) · Problems: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
 
@@ -56,7 +57,7 @@ Details: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 ## Build
 
 ```powershell
-./build.ps1 -Test    # tests + release build → dist/MonarchNext-Setup.exe
+./build.ps1 -Test    # tests + release build → dist/SoloLevelingShell-Setup.exe
 ```
 
 Requires stable Rust on Windows (`x86_64-pc-windows-msvc`, or the GNU toolchain with WinLibs).
@@ -69,3 +70,11 @@ How it fits together: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## License
 
 MIT © EsamLasheen. Bundled fonts are under the SIL Open Font License; icons derive from Lucide (ISC).
+
+## Credits
+
+- **[NibrasShell](https://github.com/AhmedSaadi0/NibrasShell)** by **Ahmed Saadi** — the original shell
+  (Quickshell/Hyprland) whose design and interaction model this project follows. This is an
+  independent Windows implementation, not an official port.
+- Fonts: Rajdhani, Alexandria, Reem Kufi (SIL OFL). Icons: [Lucide](https://lucide.dev) (ISC).
+- Weather: [Open-Meteo](https://open-meteo.com).

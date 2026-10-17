@@ -45,7 +45,7 @@ fn message(text: &str, error: bool) {
         MessageBoxW(
             None,
             PCWSTR(t.as_ptr()),
-            w!("Monarch Next"),
+            w!("Solo Leveling Shell"),
             MB_OK
                 | if error {
                     MB_ICONERROR
@@ -82,8 +82,8 @@ fn main() {
             let answer = unsafe {
                 MessageBoxW(
                     None,
-                    w!("Remove Monarch Next? The Windows taskbar comes back and your saved preferences are kept."),
-                    w!("Monarch Next"),
+                    w!("Remove Solo Leveling Shell? The Windows taskbar comes back and your saved preferences are kept."),
+                    w!("Solo Leveling Shell"),
                     MB_YESNO | MB_ICONQUESTION,
                 )
             };
@@ -144,7 +144,7 @@ fn diagnostics(output: Option<&String>) -> std::io::Result<()> {
     let config = monarch_core::Settings::load(&p.settings);
     let features = serde_json::json!({"topBar":true,"appbarReservation":true,"tray":true,"workspaces":true,"smartCapsule":true,"mediaSessions":true,"weather":true,"focusTimer":true,"leftBar":true,"panels":10,"wifiManager":true,"radios":true,"brightness":true,"volume":true,"processes":true,"disks":true,"alerts":true,"networkUsage":true,"clipboardHistory":true,"todo":true,"power":true,"launcher":true,"calculator":true,"tilingWindowManager":true,"wallpaper":true,"dynamicAccent":true,"focusGlow":true,"taskbarHidden":true,"gemini":true,"crashRecovery":true,"autostart":true});
     let report = serde_json::json!({
-        "product":"Monarch Next", "version":env!("CARGO_PKG_VERSION"), "architecture":std::env::consts::ARCH,
+        "product":"Solo Leveling Shell", "version":env!("CARGO_PKG_VERSION"), "architecture":std::env::consts::ARCH,
         "settingsPath":p.settings, "settingsValid":config.is_ok(), "settingsError":config.err().map(|e|e.to_string()),
         "externalProgramsRequired":[], "browserRuntimeRequired":false,
         "shortcutCount":63,

@@ -10,10 +10,10 @@ BEGIN
   BLOCK "040904b0"
   BEGIN
    VALUE "CompanyName", "EsamLasheen\0"
-   VALUE "FileDescription", "Monarch Next desktop shell\0"
+   VALUE "FileDescription", "Solo Leveling Shell\0"
    VALUE "FileVersion", "0.5.0\0"
    VALUE "LegalCopyright", "Copyright (c) 2026 EsamLasheen. MIT License.\0"
-   VALUE "ProductName", "Monarch Next\0"
+   VALUE "ProductName", "Solo Leveling Shell\0"
    VALUE "ProductVersion", "0.5.0\0"
   END
  END

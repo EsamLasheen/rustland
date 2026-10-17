@@ -21,7 +21,9 @@ pub fn install() -> io::Result<PathBuf> {
     };
     let source = std::env::current_exe()?;
     let dir = install_dir()?;
-    let shortcut_path = known_folder(&FOLDERID_Programs)?.join("Monarch Next.lnk");
+    let shortcut_path = known_folder(&FOLDERID_Programs)?.join("Solo Leveling Shell.lnk");
+    // earlier builds used another Start-menu name
+    let _ = std::fs::remove_file(known_folder(&FOLDERID_Programs)?.join("Monarch Next.lnk"));
     let target = dir.join("MonarchNext.exe");
     let upgrading = target.exists();
     if upgrading {
@@ -103,7 +105,7 @@ fn shortcut(target: &Path, shortcut_path: &Path) -> io::Result<()> {
             let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
             let p = wide(target);
             link.SetPath(PCWSTR(p.as_ptr()))?;
-            link.SetDescription(w!("Monarch Next desktop shell"))?;
+            link.SetDescription(w!("Solo Leveling Shell"))?;
             let persist: IPersistFile = windows::core::Interface::cast(&link)?;
             let dest = wide(shortcut_path);
             persist.Save(PCWSTR(dest.as_ptr()), true)
@@ -141,7 +143,7 @@ fn register_uninstall(target: &Path, registry_path: &str) -> io::Result<()> {
         .map_err(io::Error::other)?;
     }
     let result = (|| {
-        set_string(key, "DisplayName", "Monarch Next")?;
+        set_string(key, "DisplayName", "Solo Leveling Shell")?;
         set_string(key, "DisplayVersion", env!("CARGO_PKG_VERSION"))?;
         set_string(key, "Publisher", "EsamLasheen")?;
         set_string(
@@ -281,7 +283,7 @@ fn close_processes_of(exe: &Path) -> io::Result<()> {
                 let _ = CloseHandle(h);
                 if w != WAIT_OBJECT_0 {
                     return Err(io::Error::other(
-                        "Monarch Next is still running. Close it, then run setup again.",
+                        "Solo Leveling Shell is still running. Close it, then run setup again.",
                     ));
                 }
             }
@@ -325,9 +327,11 @@ pub fn finish_uninstall(parent: u32) -> io::Result<()> {
     if installed.exists() {
         fs::remove_file(installed)?;
     }
-    let shortcut = known_folder(&FOLDERID_Programs)?.join("Monarch Next.lnk");
-    if shortcut.exists() {
-        fs::remove_file(shortcut)?;
+    for name in ["Solo Leveling Shell.lnk", "Monarch Next.lnk"] {
+        let shortcut = known_folder(&FOLDERID_Programs)?.join(name);
+        if shortcut.exists() {
+            fs::remove_file(shortcut)?;
+        }
     }
     unsafe {
         RegDeleteTreeW(

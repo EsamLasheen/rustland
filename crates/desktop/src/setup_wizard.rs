@@ -179,7 +179,7 @@ unsafe fn build(h: HWND) {
         )
     };
 
-    label(y, "Set up Monarch Next  ·  إعداد Monarch Next", bold);
+    label(y, "Solo Leveling Shell  ·  سولو ليفلينج", bold);
     y += s(26);
     label(
         y,
@@ -461,9 +461,9 @@ pub fn ask(update: bool) -> Option<Choices> {
             ..Default::default()
         });
         let title = if update {
-            w!("Update Monarch Next")
+            w!("Update Solo Leveling Shell")
         } else {
-            w!("Install Monarch Next")
+            w!("Install Solo Leveling Shell")
         };
         let h = CreateWindowExW(
             WINDOW_EX_STYLE(0),

@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const APP_NAME: &str = "Monarch Next";
+pub const APP_NAME: &str = "Solo Leveling Shell";
 pub const SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

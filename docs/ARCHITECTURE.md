@@ -1,6 +1,6 @@
 # Architecture
 
-Monarch Next is one Windows executable written in Rust against the Win32/WinRT APIs (the `windows`
+Solo Leveling Shell is one Windows executable written in Rust against the Win32/WinRT APIs (the `windows`
 crate). It has no runtime dependencies beyond what ships with Windows 10/11: no browser engine, no
 scripting runtime, no local web server, no helper programs.
 
