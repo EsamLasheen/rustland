@@ -63,7 +63,6 @@ Requires stable Rust on Windows (`x86_64-pc-windows-msvc`, or the GNU toolchain 
 
 - `crates/core` — pure logic with unit tests (layout tree, shortcuts, launcher, usage, focus timer…)
 - `crates/desktop` — the shell: Direct2D/DirectWrite renderer, surfaces, runtime, subsystems, installer
-- `crates/package` — manifest helper used by the build
 
 How it fits together: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 

@@ -53,7 +53,6 @@ text is right-to-left aware. Icons are Lucide SVG paths converted to Direct2D ge
 - `crates/core`: platform-independent logic with unit tests: tiling layout tree and workspaces,
   launcher ranking and calculator, network usage and alerts, focus timer, local data (tasks, clipboard).
 - `crates/desktop`: the application (surfaces, runtime, subsystems, installer, setup wizard).
-- `crates/package`: build helper that patches and verifies the application manifest.
 
 ## Data
 

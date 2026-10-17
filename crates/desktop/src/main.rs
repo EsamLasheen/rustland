@@ -1,4 +1,7 @@
 #![windows_subsystem = "windows"]
+// GNU toolchain: ld reports that it replaced the toolchain's default manifest with app.manifest
+// (resource 1, verified); that is the intended result, not a problem.
+#![allow(linker_messages)]
 use monarch_platform as platform;
 mod ai;
 mod appicons;

@@ -1,5 +1,6 @@
 param([switch]$Test)
-$ErrorActionPreference = 'Stop'
+# cargo writes progress to stderr; failures are detected through exit codes below
+$ErrorActionPreference = 'Continue'
 $projectRoot = $PSScriptRoot
 $targetRoot = if ($env:CARGO_TARGET_DIR) { [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR) } else { Join-Path $projectRoot 'target' }
 $cargoTool = Get-Command cargo -ErrorAction Stop
@@ -20,8 +21,6 @@ try {
     $releaseDir = Join-Path $projectRoot 'dist'
     New-Item -ItemType Directory -Force $releaseDir | Out-Null
     Copy-Item -LiteralPath (Join-Path $targetRoot 'release\monarch-next.exe') -Destination (Join-Path $releaseDir 'MonarchNext.exe') -Force
-    & (Join-Path $targetRoot 'release\monarch-package.exe') patch (Join-Path $releaseDir 'MonarchNext.exe')
-    if ($LASTEXITCODE -ne 0) { throw 'Manifest verification failed.' }
     # the same executable installs itself when its file name contains "setup"
     Move-Item -LiteralPath (Join-Path $releaseDir 'MonarchNext.exe') -Destination (Join-Path $releaseDir 'MonarchNext-Setup.exe') -Force
     $hash = Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $releaseDir 'MonarchNext-Setup.exe')
