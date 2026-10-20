@@ -192,7 +192,75 @@ pub fn applications() -> Vec<Application> {
     }
     out.sort_by(|a, b| a.search_key.cmp(&b.search_key));
     out.dedup_by(|a, b| a.label.eq_ignore_ascii_case(&b.label) && a.path == b.path);
+    merge_apps_folder(out, apps_folder())
+}
+/// Upper bound on the whole index (shortcuts + Apps folder entries).
+const MAX_APPS: usize = 5000;
+/// `(display name, parsing name)` of every entry in the shell Apps folder: Store/UWP apps (parsing
+/// name = AUMID) as well as desktop apps. Initialises COM (apartment-threaded) on the calling
+/// thread if it has none yet; empty on any failure.
+fn apps_folder() -> Vec<(String, String)> {
+    use windows::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, IBindCtx, COINIT_APARTMENTTHREADED,
+    };
+    let mut out = vec![];
+    unsafe {
+        // S_FALSE (already initialised) also needs a matching CoUninitialize; RPC_E_CHANGED_MODE
+        // (thread is MTA) does not, and the shell folder still enumerates there.
+        let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let read = |item: &IShellItem, kind: SIGDN| -> Option<String> {
+            let p = item.GetDisplayName(kind).ok()?;
+            let s = p.to_string().ok();
+            CoTaskMemFree(Some(p.0.cast()));
+            s.filter(|s| !s.trim().is_empty())
+        };
+        if let Ok(folder) =
+            SHGetKnownFolderItem::<IShellItem>(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None)
+        {
+            if let Ok(items) =
+                folder.BindToHandler::<_, IEnumShellItems>(None::<&IBindCtx>, &BHID_EnumItems)
+            {
+                let mut one = [None];
+                while out.len() < MAX_APPS && items.Next(&mut one, None).is_ok() {
+                    let Some(item) = one[0].take() else { break };
+                    if let (Some(label), Some(id)) = (
+                        read(&item, SIGDN_NORMALDISPLAY),
+                        read(&item, SIGDN_PARENTRELATIVEPARSING),
+                    ) {
+                        out.push((label, id));
+                    }
+                }
+            }
+        }
+        if com {
+            CoUninitialize();
+        }
+    }
     out
+}
+/// Add Apps folder entries whose name no Start-menu shortcut already has (shortcuts win: they keep
+/// their arguments and resolve to a real file for icons). Entries launch as `shell:AppsFolder\<id>`.
+fn merge_apps_folder(
+    mut apps: Vec<Application>,
+    folder: Vec<(String, String)>,
+) -> Vec<Application> {
+    let mut seen: std::collections::HashSet<String> =
+        apps.iter().map(|a| a.search_key.clone()).collect();
+    for (label, id) in folder {
+        if apps.len() >= MAX_APPS {
+            break;
+        }
+        let key = label.to_lowercase();
+        if seen.insert(key.clone()) {
+            apps.push(Application {
+                label,
+                search_key: key,
+                path: PathBuf::from(format!("shell:AppsFolder\\{id}")),
+            });
+        }
+    }
+    apps.sort_by(|a, b| a.search_key.cmp(&b.search_key));
+    apps
 }
 pub fn search(apps: &[Application], query: &str) -> Vec<usize> {
     let needle = query.to_lowercase();
@@ -289,6 +357,33 @@ pub fn open(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn apps_folder_entries_merge_and_rank() {
+        let lnk = vec![Application {
+            label: "Notepad".into(),
+            search_key: "notepad".into(),
+            path: PathBuf::from(r"C:\Start\Notepad.lnk"),
+        }];
+        let folder = vec![
+            ("Calculator".into(), "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into()),
+            ("NOTEPAD".into(), "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App".into()),
+            ("Settings".into(), "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel".into()),
+        ];
+        let apps = merge_apps_folder(lnk, folder);
+        // the shortcut wins over the same-named Store entry
+        assert_eq!(apps.len(), 3);
+        let note = apps.iter().find(|a| a.search_key == "notepad").unwrap();
+        assert!(note.path.ends_with("Notepad.lnk"));
+        let names: Vec<&str> = apps.iter().map(|a| a.search_key.as_str()).collect();
+        let hit = &apps[monarch_core::launcher::rank(&names, "calc", 8)[0]];
+        assert_eq!(hit.label, "Calculator");
+        assert_eq!(
+            hit.path,
+            PathBuf::from(r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App")
+        );
+        let settings = monarch_core::launcher::rank(&names, "settings", 8)[0];
+        assert_eq!(apps[settings].label, "Settings");
+    }
     #[test]
     fn task_store_roundtrip_and_corruption_preservation() {
         let root = std::env::temp_dir().join(format!(

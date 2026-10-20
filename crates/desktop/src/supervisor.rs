@@ -39,6 +39,8 @@ pub fn run() -> std::io::Result<()> {
         }
     }
     let mut crashes: Vec<Instant> = vec![];
+    // slower crash loops (one every 30 s, say) are caught by an hourly budget
+    let mut hourly: Vec<Instant> = vec![];
     loop {
         let status = std::process::Command::new(&exe)
             .arg("--shell-child")
@@ -53,21 +55,23 @@ pub fn run() -> std::io::Result<()> {
         if status.code() == Some(FATAL_EXIT) {
             crate::taskbar::restore_after_crash();
             return Err(std::io::Error::other(
-                "Solo Leveling Shell could not start. Details are in session.log.",
+                "RustLand could not start. Details are in session.log.",
             ));
         }
         let now = Instant::now();
         crashes.retain(|t| now.duration_since(*t) < WINDOW);
         crashes.push(now);
+        hourly.retain(|t| now.duration_since(*t) < Duration::from_secs(3600));
+        hourly.push(now);
         log(&format!(
             "shell exited unexpectedly ({status}); crashes in the last 2 min: {}",
             crashes.len()
         ));
-        if crashes.len() >= MAX_CRASHES {
+        if crashes.len() >= MAX_CRASHES || hourly.len() >= 10 {
             // give the desktop back rather than crash-looping
             crate::taskbar::restore_after_crash();
             return Err(std::io::Error::other(
-                "Solo Leveling Shell stopped after repeated crashes. Details are in session.log.",
+                "RustLand stopped after repeated crashes. Details are in session.log.",
             ));
         }
         std::thread::sleep(Duration::from_millis(500 * crashes.len() as u64));

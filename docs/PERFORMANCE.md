@@ -3,10 +3,10 @@
 Measured on the same laptop (i5-12500H, 16 GB, Windows 11), 60 s idle window, every process of
 the stack including child processes, with `scripts/compare-stacks.ps1`.
 
-Solo Leveling Shell replaced an earlier setup of the same theme built from several tools
+RustLand replaced an earlier setup of the same theme built from several tools
 (komorebi + whkd + Zebar with WebView2 widgets + Flow Launcher + a small Rust hub).
 
-| | Previous setup | Solo Leveling Shell |
+| | Previous setup | RustLand |
 |---|---|---|
 | Processes | 20 | 2 |
 | CPU (share of all cores) | 0.31 % | 0.026 % |

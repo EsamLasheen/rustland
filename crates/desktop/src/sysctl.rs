@@ -826,7 +826,14 @@ impl WorkerState {
         }
     }
 
+    /// The radio list is re-read when a radio is missing (Bluetooth adapters appear late after
+    /// resume, USB dongles come and go).
     fn ensure_radios(&mut self, shared: &Arc<Shared>) {
+        if self.radios.as_ref().is_some_and(|r| {
+            r.find(RadioType::WiFi).is_none() || r.find(RadioType::Bluetooth).is_none()
+        }) {
+            self.radios = None;
+        }
         if self.radios.is_none() {
             self.radios = Radios::open(shared);
         }

@@ -73,6 +73,9 @@ const WM_APPBAR: u32 = WM_APP + 45;
 const WM_SHELL_RELAYOUT: u32 = WM_APP + 54;
 const WM_SHELL_REAPPBAR: u32 = WM_APP + 55;
 const T_CLIP: usize = 10;
+/// Title changes of the focused window are folded into one bar repaint per 200 ms.
+const T_TITLE: usize = 11;
+static TITLE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const TME_LEAVE: TRACKMOUSEEVENT_FLAGS = TRACKMOUSEEVENT_FLAGS(2);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -88,6 +91,8 @@ enum Role {
 pub enum Cmd {
     Panel(Tab),
     PanelClose,
+    /// Close the panel and the capsule card.
+    Dismiss,
     Capsule(capsule::Tab),
     Launcher,
     Launch(String),
@@ -153,6 +158,8 @@ struct Shell {
     panel_anim: Option<Anim>,
     panel_slide: f32,
     cap_anim: Option<Anim>,
+    /// The app that had the keyboard before the capsule card opened (given back on close).
+    cap_prev: HWND,
     cap_morph: f32,
     cap_island_w: f32,
     left_shown: bool,
@@ -178,6 +185,18 @@ fn scale(h: HWND) -> f32 {
 }
 fn screen() -> (i32, i32) {
     unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
+}
+
+/// Theme for the settings: a Material You scheme from the wallpaper's source colour when dynamic
+/// colours are on, else the classic theme around the rank/preset accent.
+fn tokens_of(cfg: &config::ShellConfig) -> Tokens {
+    match (
+        cfg.dynamic_accent,
+        monarch_core::material::parse_hex(&cfg.seed),
+    ) {
+        (true, Some(seed)) => Tokens::from_scheme(&monarch_core::material::Scheme::dark(seed)),
+        _ => Tokens::new(accent_of(cfg)),
+    }
 }
 
 fn accent_of(cfg: &config::ShellConfig) -> Color {
@@ -528,8 +547,10 @@ fn save_usage(s: &mut Shell) {
     }
 }
 
-fn refresh_window(s: &mut Shell) {
+/// Update the bar's focused-window title and icon; true when anything shown changed.
+fn refresh_window(s: &mut Shell) -> bool {
     let fg = unsafe { GetForegroundWindow() };
+    let before = s.fg;
     // a window minimized by a workspace switch can stay "foreground" without being on screen
     let on_screen = |h: HWND| unsafe { !IsIconic(h).as_bool() };
     if crate::shell::is_app_window(fg) && !is_own(fg) && on_screen(fg) {
@@ -543,11 +564,15 @@ fn refresh_window(s: &mut Shell) {
         s.fg = HWND::default();
     }
     let title = crate::shell::window_title(s.fg);
-    s.top.window_title = if title.is_empty() {
-        "Solo Leveling Shell".into()
+    let title = if title.is_empty() {
+        "RustLand".into()
     } else {
         title
     };
+    if s.fg == before && title == s.top.window_title && !s.fg.is_invalid() {
+        return false; // same window, same title: nothing to fetch or repaint
+    }
+    s.top.window_title = title;
     s.top.window_icon = crate::appicons::for_window(s.fg);
     s.top.window_letter = crate::appicons::exe_of(s.fg).and_then(|p| {
         std::path::Path::new(&p).file_stem().map(|x| {
@@ -558,6 +583,7 @@ fn refresh_window(s: &mut Shell) {
                 .to_ascii_uppercase()
         })
     });
+    true
 }
 
 fn refresh_clock(s: &mut Shell) {
@@ -674,7 +700,12 @@ fn save_tasks(s: &mut Shell) {
 
 fn apply_config(s: &mut Shell) {
     let c = &s.store.config;
-    s.tokens = Tokens::new(accent_of(c));
+    s.tokens = if c.glass {
+        tokens_of(c).glassy()
+    } else {
+        tokens_of(c)
+    };
+    render::set_glass(c.glass);
     s.pn.rank = c.rank;
     s.pn.ranks = config::RANKS
         .iter()
@@ -684,6 +715,7 @@ fn apply_config(s: &mut Shell) {
     s.pn.rotate_hours = c.rotate_hours;
     s.pn.dynamic_accent = c.dynamic_accent;
     s.pn.reduce_motion = c.reduce_motion;
+    s.pn.glass = c.glass;
     s.pn.leftbar_autohide = c.leftbar_autohide;
     s.pn.focus_pulse = c.focus_pulse.clone();
     s.pn.rotate_enabled = c.rotate_enabled;
@@ -921,6 +953,7 @@ pub fn run_cmd(cmd: Cmd) {
     match cmd {
         Cmd::Panel(tab) => toggle_panel(tab),
         Cmd::PanelClose => close_panel(),
+        Cmd::Dismiss => dismiss_surfaces(),
         Cmd::Capsule(tab) => open_capsule(tab),
         Cmd::Launcher => crate::launcher::toggle(),
         Cmd::Launch(target) => {
@@ -991,7 +1024,17 @@ fn open_capsule(tab: capsule::Tab) {
     resize_capsule();
     with(|s| unsafe {
         if s.cap.expanded {
+            let fg = GetForegroundWindow();
+            if !is_own(fg) {
+                s.cap_prev = fg;
+            }
             focus_window(s.capsule);
+        } else {
+            // collapsing: typing goes back to the app the user was in
+            let prev = std::mem::take(&mut s.cap_prev);
+            if GetForegroundWindow() == s.capsule && IsWindow(Some(prev)).as_bool() {
+                let _ = SetForegroundWindow(prev);
+            }
         }
     });
     paint(Role::Capsule);
@@ -1063,6 +1106,8 @@ fn on_panel_hit(hit: panel::Hit, x: f32) {
         H::Preset(name) => {
             with(|s| {
                 s.store.config.preset = name.clone();
+                // a picked theme wins over the wallpaper colours
+                s.store.config.dynamic_accent = false;
                 s.store.config.accent = if name == "ShadowMonarch" {
                     config::rank_color(s.store.config.rank).into()
                 } else {
@@ -1093,6 +1138,7 @@ fn on_panel_hit(hit: panel::Hit, x: f32) {
                 match key {
                     "dynamicAccent" => c.dynamic_accent = !c.dynamic_accent,
                     "reduceMotion" => c.reduce_motion = !c.reduce_motion,
+                    "glass" => c.glass = !c.glass,
                     "leftbarAutohide" => c.leftbar_autohide = !c.leftbar_autohide,
                     "rotateEnabled" => c.rotate_enabled = !c.rotate_enabled,
                     "focusPulse" => {
@@ -1112,6 +1158,11 @@ fn on_panel_hit(hit: panel::Hit, x: f32) {
                 }
                 apply_config(s);
                 save_config(s);
+                subsystems::set_accent(s.tokens.accent, s.store.config.rank);
+                subsystems::set_rotation(
+                    s.store.config.rotate_enabled,
+                    s.store.config.rotate_hours,
+                );
             });
             if key == "leftbarAutohide" {
                 place_bar();
@@ -1227,8 +1278,19 @@ fn on_panel_hit(hit: panel::Hit, x: f32) {
             });
         }
         H::Radio(kind) => {
-            let on = with(|s| if kind == "bluetooth" { s.pn.bt_on } else { s.pn.wifi_on } == Some(true)).unwrap_or(false);
-            subsystems::radio(kind, on);
+            // unknown state (not read yet): read it instead of guessing a direction
+            match with(|s| {
+                if kind == "bluetooth" {
+                    s.pn.bt_on
+                } else {
+                    s.pn.wifi_on
+                }
+            })
+            .flatten()
+            {
+                Some(on) => subsystems::radio(kind, on),
+                None => subsystems::send(sysctl::Command::RefreshRadios),
+            }
         }
         H::WifiToggle => {
             let on = with(|s| s.pn.wifi_on == Some(true)).unwrap_or(false);
@@ -1257,10 +1319,9 @@ fn on_panel_hit(hit: panel::Hit, x: f32) {
             });
         }
         H::NextWallpaper => subsystems::rotate_wallpaper(),
-        H::Diagnose => {
-            if let Ok(p) = crate::platform::paths() {
-                let _ = crate::platform::open(&p.data);
-            }
+        H::RefreshProcs => {
+            subsystems::send(sysctl::Command::SampleProcesses);
+            subsystems::send(sysctl::Command::RefreshDisks);
         }
         H::AiSaveKey
         | H::AiTest
@@ -1567,9 +1628,10 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
     match msg {
         WM_TIMER => {
             match w.0 {
-                T_CLOCK => { with(|s| { refresh_clock(s); save_usage(s); if s.pn.tab == Some(Tab::Notifications) { sync_alerts(s); } }); arm_clock(h); resize_capsule(); paint(Role::Capsule); }
+                T_CLOCK => { with(|s| { refresh_clock(s); if unsafe { windows::Win32::System::SystemInformation::GetLocalTime() }.wMinute % 10 == 0 { save_usage(s); }; if s.pn.tab == Some(Tab::Notifications) { sync_alerts(s); } }); arm_clock(h); resize_capsule(); paint(Role::Capsule); }
                 T_CARET => { let on_panel = with(|s| { s.caret_on = !s.caret_on; s.pn.focused_input.is_some() && s.pn.tab.is_some() && s.panel_slide > 0. }).unwrap_or(false); if on_panel { paint(Role::Panel); } else { let _ = KillTimer(Some(h), T_CARET); } }
                 T_CLIP => { let _ = KillTimer(Some(h), T_CLIP); capture_clipboard(h); }
+                T_TITLE => { let _ = KillTimer(Some(h), T_TITLE); TITLE_ARMED.store(false, std::sync::atomic::Ordering::Relaxed); if with(refresh_window).unwrap_or(false) { paint(Role::Bar); } }
                 T_FOCUS => {
                     if !with(apply_focus).unwrap_or(false) { let _ = KillTimer(Some(h), T_FOCUS); }
                     paint(Role::Capsule);
@@ -1610,6 +1672,40 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
             }
             LRESULT(0)
         }
+        // sliders follow the pointer while the button is held (captured, so it may leave the track)
+        WM_LBUTTONDOWN if role == Some(Role::Panel) => {
+            let (x, y) = hit_point(h, l);
+            let hit = with(|s| s.hits_panel.iter().find(|(r, _)| r.contains(x, y)).map(|(_, hh)| hh.clone())).flatten();
+            if let Some(panel::Hit::Slider(key, track)) = hit {
+                SLIDER.with(|c| c.set(Some((key, track, Instant::now()))));
+                SetCapture(h);
+                on_panel_hit(panel::Hit::Slider(key, track), x);
+                paint(Role::Panel);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE if SLIDER.with(|c| c.get()).is_some() => {
+            let (x, _) = hit_point(h, l);
+            if let Some((key, track, last)) = SLIDER.with(|c| c.get()) {
+                // brightness is a slow WMI call: at most ~25 updates a second
+                if last.elapsed() >= std::time::Duration::from_millis(40) {
+                    SLIDER.with(|c| c.set(Some((key, track, Instant::now()))));
+                    on_panel_hit(panel::Hit::Slider(key, track), x);
+                    paint(Role::Panel);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP if SLIDER.with(|c| c.get()).is_some() => {
+            let (x, _) = hit_point(h, l);
+            if let Some((key, track, _)) = SLIDER.with(|c| c.take()) {
+                let _ = ReleaseCapture();
+                on_panel_hit(panel::Hit::Slider(key, track), x);
+                paint(Role::Panel);
+            }
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED if SLIDER.with(|c| c.get()).is_some() => { SLIDER.with(|c| c.set(None)); LRESULT(0) }
         WM_LBUTTONUP => {
             let (x, y) = hit_point(h, l);
             match role {
@@ -1635,7 +1731,8 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                         Some(capsule::Hit::OpenObsidian) => crate::wm_bridge::open("obsidian"),
                         Some(capsule::Hit::NextSession) => subsystems::next_session(),
                         Some(other) => subsystems::media(&other),
-                        None => { if with(|s| s.cap.expanded).unwrap_or(false) { let t = with(|s| s.cap.tab.unwrap_or(capsule::Tab::Weather)).unwrap_or(capsule::Tab::Weather); open_capsule(t); } }
+                        // the card body is not a button: only X, Escape and outside clicks close it
+                        None => {}
                     }
                 }
                 None => {}
@@ -1691,6 +1788,14 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
             }
             LRESULT(0)
         }
+        // the collapsed pill is clicked without taking the keyboard from the user's app
+        WM_MOUSEACTIVATE if role == Some(Role::Capsule) && !with(|s| s.cap.expanded).unwrap_or(false) => LRESULT(MA_NOACTIVATE as isize),
+        // Alt+Tab / Win key away from an open panel or card closes it (mouse clicks are the hook's)
+        WM_ACTIVATE if (role == Some(Role::Panel) || role == Some(Role::Capsule)) && (w.0 & 0xFFFF) as u32 == WA_INACTIVE => {
+            let to = HWND(l.0 as *mut _);
+            if !to.is_invalid() && !is_own(to) { post_cmd(Cmd::Dismiss); }
+            DefWindowProcW(h, msg, w, l)
+        }
         WM_KEYDOWN if role == Some(Role::Panel) || role == Some(Role::Capsule) => {
             if role == Some(Role::Capsule) {
                 if w.0 as u16 == VK_ESCAPE.0 && with(|s| s.cap.expanded).unwrap_or(false) { let t = with(|s| s.cap.tab.unwrap_or(capsule::Tab::Weather)).unwrap_or(capsule::Tab::Weather); open_capsule(t); }
@@ -1702,7 +1807,8 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
         subsystems::WM_SYSCTL => {
             let ch = with(|s| {
                 let ch = subsystems::drain(&mut s.cap, &mut s.pn, &mut s.top);
-                if let Some(b) = s.pn.brightness { if let Some(r) = s.osd.brightness(b) { post_request(r); } }
+                // the open panel already shows the level (its slider, or the read when it opened)
+                if let Some(b) = s.pn.brightness { if let Some(r) = s.osd.brightness(b) { if s.pn.tab.is_none() { post_request(r); } } }
                 if let Some(m) = &s.cap.media { if let Some(r) = s.osd.track(&m.title, &m.artist) { post_request(r); } }
                 ch
             });
@@ -1731,14 +1837,18 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
             LRESULT(0)
         }
         subsystems::WM_WALLPAPER => {
-            if let Some((image, accent, rotated)) = subsystems::take_wallpaper_event(l) {
+            if let Some((image, seed, rotated)) = subsystems::take_wallpaper_event(l) {
                 with(|s| {
                     let c = &mut s.store.config;
                     if let Some(i) = &image { c.wallpaper = i.to_string_lossy().into(); }
                     let shown = c.wallpaper.clone();
                     if let Some(r) = s.osd.wallpaper(&shown) { post_request(r); }
                     if let Some(at) = rotated { c.last_rotation_ms = at; }
-                    if let (Some(a), true) = (accent, c.dynamic_accent) { c.accent = a.to_hex(); }
+                    if let Some(seed) = seed {
+                        // Material You source colour of the shown image; the theme is generated
+                        // from it while dynamic colours are on (tokens_of), the picked accent stays
+                        c.seed = monarch_core::material::hex(seed);
+                    }
                     apply_config(s);
                     save_config(s);
                     let id = s.store.config.wallpaper.clone();
@@ -1804,8 +1914,8 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
             paint(Role::Capsule);
             LRESULT(0)
         }
-        WM_SHELL_FG => { with(refresh_window); paint(Role::Bar); LRESULT(0) }
-        crate::wm::WM_STATE_CHANGED => { with(refresh_workspaces); paint(Role::Bar); LRESULT(0) }
+        WM_SHELL_FG => { if with(refresh_window).unwrap_or(false) { paint(Role::Bar); } LRESULT(0) }
+        crate::wm::WM_STATE_CHANGED => { with(|s| { refresh_workspaces(s); refresh_window(s); }); paint(Role::Bar); LRESULT(0) }
         WM_SHELL_EDGE => {
             let near = w.0 != 0;
             with(|s| s.edge_near = near);
@@ -1828,7 +1938,7 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
 
         WM_APPBAR => { if w.0 as u32 == ABN_POSCHANGED { place_bar(); } LRESULT(0) }
         WM_DISPLAYCHANGE | WM_DPICHANGED if role == Some(Role::Bar) => { let _ = PostMessageW(Some(h), WM_SHELL_RELAYOUT, WPARAM(0), LPARAM(0)); LRESULT(0) }
-        WM_SHELL_REAPPBAR => { register_appbar(); place_bar(); LRESULT(0) }
+        WM_SHELL_REAPPBAR => { register_appbar(); LEFT_APPBAR.with(|c| c.set(false)); place_bar(); LRESULT(0) }
         WM_SHELL_RELAYOUT => { place_bar(); resize_capsule(); repaint_all(); LRESULT(0) }
         WM_CLOSE if role != Some(Role::Bar) => { dismiss_surfaces(); LRESULT(0) }
         WM_QUERYENDSESSION => LRESULT(1),
@@ -1845,6 +1955,8 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
 static TASKBAR_CREATED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 thread_local! { static HIGH_SURROGATE: std::cell::Cell<u16> = const { std::cell::Cell::new(0) }; }
 thread_local! { static LEFT_APPBAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+// Slider being dragged in the panel: (key, track, last update).
+thread_local! { static SLIDER: std::cell::Cell<Option<(&'static str, Rect, Instant)>> = const { std::cell::Cell::new(None) }; }
 
 unsafe fn arm_clock(h: HWND) {
     let t = windows::Win32::System::SystemInformation::GetLocalTime();
@@ -1950,7 +2062,14 @@ unsafe extern "system" fn on_fg(
     _: u32,
     _: u32,
 ) {
-    if ev == EVENT_OBJECT_NAMECHANGE && (obj != 0 || h != GetForegroundWindow()) {
+    if ev == EVENT_OBJECT_NAMECHANGE {
+        if obj != 0 || h != GetForegroundWindow() {
+            return;
+        }
+        // terminals, downloads and players retitle many times a second
+        if !TITLE_ARMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            SetTimer(Some(root()), T_TITLE, 200, None);
+        }
         return;
     }
     let _ = PostMessageW(Some(root()), WM_SHELL_FG, WPARAM(0), LPARAM(0));
@@ -2017,6 +2136,10 @@ pub fn debug_enabled() -> bool {
 /// Run the shell until the bar window closes.
 pub fn run() -> std::io::Result<()> {
     let paths = crate::platform::paths()?;
+    // one shell per session even when an orphaned child outlived its supervisor
+    let Some(_instance) = crate::platform::Instance::named(r"Local\MonarchNext.Surfaces")? else {
+        return Ok(());
+    };
     // a crash must never leave the user without a taskbar or screen space
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -2031,7 +2154,18 @@ pub fn run() -> std::io::Result<()> {
     }));
     let store = Store::open()?;
     let tasks_path = paths.data.join("todo.json");
-    let tasks = crate::platform::load_tasks(&tasks_path).unwrap_or_default();
+    // an unreadable list is set aside (never overwritten) and the last good copy is used, so
+    // saving keeps working instead of failing on the broken file forever
+    let tasks = match crate::platform::load_tasks(&tasks_path) {
+        Ok(t) => t,
+        Err(_) if tasks_path.exists() => {
+            let _ = std::fs::rename(&tasks_path, tasks_path.with_extension("corrupt.json"));
+            crate::platform::log(&paths, "todo.json unreadable: kept as todo.corrupt.json");
+            crate::platform::load_tasks(&tasks_path.with_extension("previous.json"))
+                .unwrap_or_default()
+        }
+        Err(_) => Default::default(),
+    };
     let usage_store: Usage = read_json(&paths.data.join("network-usage.json"));
     let alerts: Vec<Alert> = read_json(&paths.data.join("alerts.json"));
     unsafe {
@@ -2111,6 +2245,7 @@ pub fn run() -> std::io::Result<()> {
             panel_anim: None,
             panel_slide: 0.,
             cap_anim: None,
+            cap_prev: HWND::default(),
             cap_morph: 0.,
             cap_island_w: 312.,
             left_shown: false,

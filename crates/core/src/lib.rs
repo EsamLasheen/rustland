@@ -2,6 +2,7 @@
 pub mod focus;
 pub mod launcher;
 pub mod local_data;
+pub mod material;
 pub mod shortcuts;
 pub mod usage;
 pub mod wm_layout;
@@ -11,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const APP_NAME: &str = "Solo Leveling Shell";
+pub const APP_NAME: &str = "RustLand";
 pub const SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

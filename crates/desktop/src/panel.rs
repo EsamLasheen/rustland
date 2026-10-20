@@ -112,6 +112,7 @@ pub struct State {
     // settings
     pub dynamic_accent: bool,
     pub reduce_motion: bool,
+    pub glass: bool,
     pub leftbar_autohide: bool,
     pub focus_pulse: String,
     pub rotate_enabled: bool,
@@ -136,6 +137,8 @@ pub enum Input {
 #[derive(Clone, PartialEq, Debug)]
 pub enum Hit {
     Close,
+    /// Re-sample processes and disks now (Monitoring tab).
+    RefreshProcs,
     Radio(&'static str),
     Mute,
     Open(&'static str),
@@ -147,7 +150,6 @@ pub enum Hit {
     AlertsClear,
     AlertDismiss(u64),
     WindowsNotifications,
-    Diagnose,
     WifiToggle,
     Scan,
     Net(String),
@@ -430,9 +432,9 @@ impl<'a> Ui<'a> {
             }
             if focused && self.s.caret_visible {
                 let cw = self.c.measure(&shown, &theme::body(12., 400), 0.).min(tr.w);
-                // Arabic text is right-aligned, so its insertion point is at the left end of the run
+                // Arabic text sits at the left too (Align is visual); its end is the run's left edge
                 let x = if crate::render::is_rtl(&shown) {
-                    tr.right() - cw - 2.5
+                    tr.x - 1.
                 } else {
                     tr.x + cw + 1.
                 };
@@ -504,27 +506,48 @@ pub fn paint(
 ) -> (Vec<(Rect, Hit)>, f32) {
     let tab = s.tab.unwrap_or(Tab::Dashboard);
     let frame = Rect::new(2. - (1. - slide) * WIDTH, 0., WIDTH - 4., height - 2.);
-    // shadow + accent glow, then the 2 px accent border
-    for (g, a) in [(8., 0.05), (4., 0.10)] {
-        c.fill_round(
-            Rect::new(
-                frame.x - g,
-                frame.y - g + 4.,
-                frame.w + 2. * g,
-                frame.h + 2. * g,
-            ),
-            Radii::all(16. + g),
-            Color::rgba(0, 0, 0, a),
-        );
-    }
-    c.fill_round(
-        Rect::new(frame.x - 2., frame.y - 2., frame.w + 4., frame.h + 4.),
-        Radii::all(18.),
-        t.accent.alpha(0.18),
-    );
-    c.fill_round(frame, Radii::all(16.), t.accent);
     let inner = frame.inset(2.);
-    c.fill_round(inner, Radii::all(14.), Color::rgb(7, 11, 20));
+    if s.glass {
+        // Apple-style material: a light tint over the frosted desktop, a sheen from the top,
+        // and a hairline edge that catches the light (no shadow: it would frost into a halo)
+        c.fill_round(frame, Radii::all(16.), t.bg.alpha(0.20));
+        c.fill_round_vgradient(
+            frame,
+            Radii::all(16.),
+            &[
+                (0., Color::rgba(255, 255, 255, 0.10)),
+                (0.35, Color::rgba(255, 255, 255, 0.03)),
+                (1., Color::rgba(255, 255, 255, 0.0)),
+            ],
+        );
+        c.stroke_round(
+            frame.inset(0.5),
+            Radii::all(15.5),
+            Color::rgba(255, 255, 255, 0.22).mix(t.accent.alpha(0.5), 0.6),
+            1.,
+        );
+    } else {
+        // shadow + accent glow, then the 2 px accent border
+        for (g, a) in [(8., 0.05), (4., 0.10)] {
+            c.fill_round(
+                Rect::new(
+                    frame.x - g,
+                    frame.y - g + 4.,
+                    frame.w + 2. * g,
+                    frame.h + 2. * g,
+                ),
+                Radii::all(16. + g),
+                Color::rgba(0, 0, 0, a),
+            );
+        }
+        c.fill_round(
+            Rect::new(frame.x - 2., frame.y - 2., frame.w + 4., frame.h + 4.),
+            Radii::all(18.),
+            t.accent.alpha(0.18),
+        );
+        c.fill_round(frame, Radii::all(16.), t.accent);
+        c.fill_round(inner, Radii::all(14.), Color::rgb(7, 11, 20));
+    }
     let mut hits = Vec::new();
     // app bar
     let bar = Rect::new(inner.x, inner.y, inner.w, 64.);
@@ -595,9 +618,13 @@ pub fn paint(
     let content_h = ui.y - view.y;
     let scroll = s.scroll;
     for (r, h) in ui.hits {
-        let r = Rect::new(r.x, r.y - scroll, r.w, r.h);
-        if r.bottom() > view.y && r.y < view.bottom() {
-            hits.push((r, h));
+        // only the visible part of a scrolled control is clickable (not what is under the header)
+        let (top, bottom) = (
+            (r.y - scroll).max(view.y),
+            (r.bottom() - scroll).min(view.bottom()),
+        );
+        if bottom > top {
+            hits.push((Rect::new(r.x, top, r.w, bottom - top), h));
         }
     }
     c.reset_translation();
@@ -1324,7 +1351,7 @@ fn monitoring(ui: &mut Ui) {
             Rect::new(ui.x + ui.w - 14. - bw, y0, bw, 34.),
             None,
             "REFRESH",
-            Hit::Diagnose,
+            Hit::RefreshProcs,
             draw,
         );
         let mut y = y0 + 44.;
@@ -1967,7 +1994,7 @@ fn settings(ui: &mut Ui) {
                 1.8,
             );
             ui.c.text(
-                "Solo Leveling Shell",
+                "RustLand",
                 Rect::new(ui.x + 46., y0, 250., 22.),
                 &theme::head(16., 600),
                 t.text,
@@ -1988,7 +2015,7 @@ fn settings(ui: &mut Ui) {
         y += ui.toggle_row(
             y,
             "لون من الخلفية",
-            "تغيير لون الواجهة وحدود النوافذ حسب الصورة.",
+            "ألوان الثيم كلها من الخلفية بنظام Material You.",
             s.dynamic_accent,
             "dynamicAccent",
             draw,
@@ -1999,6 +2026,14 @@ fn settings(ui: &mut Ui) {
             "انتقالات أبسط بدون الأنيميشن.",
             s.reduce_motion,
             "reduceMotion",
+            draw,
+        );
+        y += ui.toggle_row(
+            y,
+            "تأثير زجاجي",
+            "ضبابية شفافة خلف الشريط والكبسولة واللوحات.",
+            s.glass,
+            "glass",
             draw,
         );
         y - y0
@@ -2149,15 +2184,21 @@ fn ai(ui: &mut Ui) {
                     21.,
                 );
             } else {
+                // a long prompt scrolls up inside the box so the line being typed stays visible
+                let font = theme::body(12., 400);
+                let th = ui.c.wrapped_height(&s.ai_prompt, r.w - 20., &font, 21.);
+                let inner = r.h - 20.;
+                ui.c.push_clip(r.inset(2.));
                 ui.c.text_wrapped(
                     &s.ai_prompt,
                     r.x + 10.,
-                    r.y + 10.,
+                    r.y + 10. - (th - inner).max(0.),
                     r.w - 20.,
-                    &theme::body(12., 400),
+                    &font,
                     t.text,
                     21.,
                 );
+                ui.c.pop_clip();
             }
         }
         ui.hit(r, Hit::Focus(Input::AiPrompt));

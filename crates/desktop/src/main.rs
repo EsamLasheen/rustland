@@ -45,7 +45,7 @@ fn message(text: &str, error: bool) {
         MessageBoxW(
             None,
             PCWSTR(t.as_ptr()),
-            w!("Solo Leveling Shell"),
+            w!("RustLand"),
             MB_OK
                 | if error {
                     MB_ICONERROR
@@ -65,6 +65,7 @@ fn main() {
         Some("--shell") => supervisor::run(),
         Some("--shell-child") => runtime::run(),
         Some("--render") => render_snapshot(args.get(1), args.get(2), args.get(3)),
+        Some("--palette") => print_palette(args.get(1), args.get(2)),
         Some("--preview") if args.get(1).map(String::as_str) == Some("topbar") => {
             shell::preview_topbar(render::Color::hex(
                 args.get(2).map(String::as_str).unwrap_or("#62baf8"),
@@ -82,8 +83,8 @@ fn main() {
             let answer = unsafe {
                 MessageBoxW(
                     None,
-                    w!("Remove Solo Leveling Shell? The Windows taskbar comes back and your saved preferences are kept."),
-                    w!("Solo Leveling Shell"),
+                    w!("Remove RustLand? The Windows taskbar comes back and your saved preferences are kept."),
+                    w!("RustLand"),
                     MB_YESNO | MB_ICONQUESTION,
                 )
             };
@@ -132,10 +133,11 @@ fn run_setup() -> std::io::Result<()> {
     };
     // install first: an update closes the running shell, so the new answers cannot be overwritten
     let target = setup::install()?;
-    setup_wizard::apply(&choices)?;
-    setup::set_autostart(&target, choices.autostart)?;
+    // the old shell is already closed: start the new one even if saving the answers failed
+    let applied = setup_wizard::apply(&choices);
+    let autostart = setup::set_autostart(&target, choices.autostart);
     std::process::Command::new(target).arg("--shell").spawn()?;
-    Ok(())
+    applied.and(autostart)
 }
 
 fn diagnostics(output: Option<&String>) -> std::io::Result<()> {
@@ -144,7 +146,7 @@ fn diagnostics(output: Option<&String>) -> std::io::Result<()> {
     let config = monarch_core::Settings::load(&p.settings);
     let features = serde_json::json!({"topBar":true,"appbarReservation":true,"tray":true,"workspaces":true,"smartCapsule":true,"mediaSessions":true,"weather":true,"focusTimer":true,"leftBar":true,"panels":10,"wifiManager":true,"radios":true,"brightness":true,"volume":true,"processes":true,"disks":true,"alerts":true,"networkUsage":true,"clipboardHistory":true,"todo":true,"power":true,"launcher":true,"calculator":true,"tilingWindowManager":true,"wallpaper":true,"dynamicAccent":true,"focusGlow":true,"taskbarHidden":true,"gemini":true,"crashRecovery":true,"autostart":true});
     let report = serde_json::json!({
-        "product":"Solo Leveling Shell", "version":env!("CARGO_PKG_VERSION"), "architecture":std::env::consts::ARCH,
+        "product":"RustLand", "version":env!("CARGO_PKG_VERSION"), "architecture":std::env::consts::ARCH,
         "settingsPath":p.settings, "settingsValid":config.is_ok(), "settingsError":config.err().map(|e|e.to_string()),
         "externalProgramsRequired":[], "browserRuntimeRequired":false,
         "shortcutCount":63,
@@ -215,8 +217,15 @@ fn render_snapshot(
     accent: Option<&String>,
 ) -> std::io::Result<()> {
     let output = output.ok_or_else(|| std::io::Error::other("Provide an output PNG path"))?;
-    let accent = render::Color::hex(accent.map(String::as_str).unwrap_or("#62baf8"));
-    let tokens = theme::Tokens::new(accent);
+    // `[accent]` is a colour (#rrggbb, classic theme) or `seed:#rrggbb` (Material You scheme)
+    let arg = accent.map(String::as_str).unwrap_or("#62baf8");
+    let tokens = match arg
+        .strip_prefix("seed:")
+        .and_then(monarch_core::material::parse_hex)
+    {
+        Some(seed) => theme::Tokens::from_scheme(&monarch_core::material::Scheme::dark(seed)),
+        None => theme::Tokens::new(render::Color::hex(arg)),
+    };
     match surface.map(String::as_str) {
         Some("topbar") => {
             let state = topbar::sample();
@@ -286,4 +295,25 @@ fn render_snapshot(
             "Unknown surface {other:?}. Available: topbar, capsule-idle, capsule-osd, capsule-weather, capsule-media, capsule-focus"
         ))),
     }
+}
+
+/// `--palette <image> <out.txt>`: the Material You source colour of an image and the dark scheme the
+/// theme would use, for checking wallpapers before adding them to the folder.
+fn print_palette(image: Option<&String>, output: Option<&String>) -> std::io::Result<()> {
+    use monarch_core::material::{hex, source_color, Scheme};
+    let image = image.ok_or_else(|| std::io::Error::other("Provide an image path"))?;
+    let output = output.ok_or_else(|| std::io::Error::other("Provide an output text path"))?;
+    let px = wallpaper::thumbnail_rgba(std::path::Path::new(image), 320, 135)?;
+    let text = match source_color(&px, 320, 135, false) {
+        Some(seed) => {
+            let s = Scheme::dark(seed);
+            format!(
+                "source {}\nprimary {}\nsecondary {}\ntertiary {}\nerror {}\nbackground {}\nsurface {}\nsurface_high {}\non_surface {}\non_surface_variant {}\noutline_variant {}\n",
+                hex(seed), hex(s.primary), hex(s.secondary), hex(s.tertiary), hex(s.error), hex(s.background),
+                hex(s.surface), hex(s.surface_high), hex(s.on_surface), hex(s.on_surface_variant), hex(s.outline_variant)
+            )
+        }
+        None => "no usable colour\n".into(),
+    };
+    std::fs::write(output, text)
 }

@@ -146,7 +146,11 @@ pub fn paint(c: &Canvas, width: f32, t: &Tokens, s: &State) -> Vec<(Rect, Hit)> 
         |v: Option<f64>| (11. + 2. + c.measure(&rate(v), &theme::label(12., 700), 0.)).max(50.);
     let net_w =
         2. + (9. + 14. + ssid_w + 9.) + 8. + rate_w(s.down_bps) + 8. + rate_w(s.up_bps) + 10.;
-    segs.push((Seg::Net, net_w));
+    // small screens: the network speeds go before the title would run under the capsule
+    let tray_w: f32 = segs.iter().map(|(_, w)| w + 2.).sum();
+    if tray_w + net_w + 2. + 120. <= left_max {
+        segs.push((Seg::Net, net_w));
+    }
     let used: f32 = segs.iter().map(|(_, w)| w).sum::<f32>() + 2. * segs.len() as f32;
     let title_w = c.measure(&s.window_title, &theme::body(11.5, 600), 0.);
     let win_w = (4. + 22. + 8. + title_w + 12.)

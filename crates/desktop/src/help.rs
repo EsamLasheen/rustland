@@ -116,9 +116,11 @@ fn paint(h: HWND) {
     let body = (0..3).map(|i| col_h(i * 2, i * 2 + 1)).fold(0f32, f32::max);
     let (w, hgt) = (3. * COL_W + 64., body + 96.);
     unsafe {
-        let k = GetDpiForWindow(h).max(96) as f32 / 96.;
-        let (pw, ph) = ((w * k) as i32, (hgt * k) as i32);
         let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+        // short or scaled-up screens: shrink the sheet to fit instead of cutting off its title
+        let fit = (sw as f32 * 0.95 / w).min(sh as f32 * 0.95 / hgt);
+        let k = (GetDpiForWindow(h).max(96) as f32 / 96.).min(fit);
+        let (pw, ph) = ((w * k) as i32, (hgt * k) as i32);
         let _ = SetWindowPos(
             h,
             Some(HWND_TOPMOST),

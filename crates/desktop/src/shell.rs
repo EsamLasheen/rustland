@@ -132,7 +132,18 @@ pub(crate) fn is_app_window(h: HWND) -> bool {
             return false;
         }
         let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
-        if ex & WS_EX_TOOLWINDOW.0 != 0 {
+        if ex & WS_EX_TOOLWINDOW.0 != 0 || !IsWindowVisible(h).as_bool() {
+            return false;
+        }
+        // hidden helper windows that apps bring forward for a tray menu, other virtual desktops
+        let mut cloaked = 0u32;
+        let _ = windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+            h,
+            windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut _,
+            4,
+        );
+        if cloaked != 0 {
             return false;
         }
         let mut cls = [0u16; 64];
@@ -157,7 +168,7 @@ fn refresh_window(b: &mut Bar) {
     }
     let title = window_title(b.fg);
     b.state.window_title = if title.is_empty() {
-        "Solo Leveling Shell".into()
+        "RustLand".into()
     } else {
         title
     };

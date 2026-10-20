@@ -4,11 +4,11 @@
 
 **Cause (ASUS TUF / ROG laptops):** Armoury Crate's *Win Key* lock is on. The lock lives in the keyboard
 controller, so the Windows key produces no input at all — not to Windows, not to Raw Input, not to any
-hook. No software (Solo Leveling Shell, komorebi, whkd, AutoHotkey) can see a key that is never sent.
+hook. No software (RustLand, komorebi, whkd, AutoHotkey) can see a key that is never sent.
 
 How it was diagnosed (2026-10-17):
 
-1. Solo Leveling Shell's keyboard hook received every other key (letters, Alt+Shift…) but never `VK_LWIN`.
+1. RustLand's keyboard hook received every other key (letters, Alt+Shift…) but never `VK_LWIN`.
 2. `scripts/diagnostics/rawkeys.ps1` (Raw Input, below all hooks) also never saw the Win key.
 3. `HKCU\Software\ASUS\Armoury Crate Service\SystemFeature\WinKeyStatus` was `0`, and Armoury Crate's
    live state (`SystemFeature_WinKey` in `ScenarioProfile\Config\CurrentStatusCache.json`) was `0`.
@@ -20,7 +20,7 @@ How it was diagnosed (2026-10-17):
 - Armoury Crate → Home → **System Settings** → System Configuration → **Win Key** (tile turns orange).
 - Run `powershell -ExecutionPolicy Bypass -File scripts\asus-winkey.ps1` (drives that same tile).
 
-Solo Leveling Shell watches `WinKeyStatus` and shows a capsule warning with these steps whenever the lock turns on.
+RustLand watches `WinKeyStatus` and shows a capsule warning with these steps whenever the lock turns on.
 
 ## Verifying the keyboard hook
 
@@ -30,4 +30,4 @@ it is checked once per run.
 
 ## Going back to Windows' own taskbar
 
-Settings → Apps → *Solo Leveling Shell* → Uninstall. The taskbar returns as it was before installation.
+Settings → Apps → *RustLand* → Uninstall. The taskbar returns as it was before installation.

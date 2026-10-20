@@ -1,5 +1,6 @@
-//! Native launcher (replaces Flow Launcher): Win+R. Fuzzy app search over Start-menu shortcuts,
-//! inline calculator, web-search fallback. Keyboard-first; closes on Esc or when it loses focus.
+//! Native launcher (replaces Flow Launcher): Win+R. Fuzzy app search over Start-menu shortcuts and
+//! Store apps, inline calculator, web-search fallback. Keyboard-first; closes on Esc or when it
+//! loses focus.
 use crate::render::{self, Align, Canvas, Radii, Rect};
 use crate::theme::{self, Tokens, R};
 use crate::topbar::Image;
@@ -7,6 +8,7 @@ use monarch_core::launcher as logic;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use windows::{
     core::w,
     Win32::{
@@ -24,6 +26,8 @@ const FIELD: f32 = 56.;
 const MAX_QUERY: usize = 256;
 /// Posted to the open launcher window by the warm thread once the app index is ready.
 const WM_APPS_READY: u32 = WM_APP + 1;
+/// Posted by the icon worker once a Store app icon requested by `draw` is ready.
+const WM_ICON_READY: u32 = WM_APP + 2;
 
 #[derive(Clone)]
 enum Item {
@@ -41,16 +45,25 @@ struct Launcher {
     hover: Option<usize>,
     /// High surrogate from a WM_CHAR waiting for its low half.
     pending_high: Option<u16>,
+    /// The index `items` point into; swapped only together with `items` (see `update`), so a
+    /// rescan finishing in the background never shifts what a row launches.
+    apps: Apps,
 }
 thread_local! { static L: RefCell<Option<Launcher>> = const { RefCell::new(None) }; }
-static APPS: Mutex<Option<Arc<Vec<crate::platform::Application>>>> = Mutex::new(None);
-/// Set while (or after) a Start-menu scan has been started, so it never runs twice.
+type Apps = Arc<Vec<crate::platform::Application>>;
+/// The app index and when its scan finished.
+static APPS: Mutex<Option<(Instant, Apps)>> = Mutex::new(None);
+/// Set while a scan is running, so two never overlap.
 static WARMING: AtomicBool = AtomicBool::new(false);
 /// The open launcher window (0 = none), notified when the index becomes ready.
 static OPEN_HWND: AtomicIsize = AtomicIsize::new(0);
+/// An index older than this is rescanned (in the background) when the launcher opens, so apps
+/// installed or removed since show up without restarting the shell.
+const STALE: Duration = Duration::from_secs(60);
 
-/// Scan the Start menu on a background thread (startup), so the first Win+R is instant.
-/// Idempotent: only the first call starts a scan.
+/// Scan the Start menu and the shell Apps folder (Store apps) on a background thread (startup), so
+/// the first Win+R is instant. No-op while a scan is already running; the previous index stays in
+/// use until the new one replaces it.
 pub fn warm() {
     if WARMING.swap(true, Ordering::AcqRel) {
         return;
@@ -63,11 +76,12 @@ pub fn warm() {
             // opened mid-scan either sees the index or receives WM_APPS_READY.
             let h = match APPS.lock() {
                 Ok(mut g) => {
-                    *g = Some(apps);
+                    *g = Some((Instant::now(), apps));
                     OPEN_HWND.load(Ordering::Acquire)
                 }
                 Err(_) => 0,
             };
+            WARMING.store(false, Ordering::Release);
             if h != 0 {
                 unsafe {
                     let _ =
@@ -79,18 +93,27 @@ pub fn warm() {
         WARMING.store(false, Ordering::Release);
     }
 }
-/// The app index, or an empty list while the background scan is still running (never scans on the
-/// UI thread; the launcher refreshes on WM_APPS_READY).
-fn apps() -> Arc<Vec<crate::platform::Application>> {
-    if let Some(a) = APPS.lock().ok().and_then(|g| g.clone()) {
+/// The app index, or an empty list while the first background scan is still running (never scans
+/// on the UI thread; the launcher refreshes on WM_APPS_READY).
+fn apps() -> Apps {
+    if let Some((_, a)) = APPS.lock().ok().and_then(|g| g.clone()) {
         return a;
     }
     warm();
     Arc::new(Vec::new())
 }
+/// Start a background rescan if the index is older than `STALE` (the old one keeps serving).
+fn refresh_if_stale() {
+    let stale = APPS
+        .lock()
+        .map(|g| g.as_ref().is_some_and(|(at, _)| at.elapsed() >= STALE))
+        .unwrap_or(false);
+    if stale {
+        warm();
+    }
+}
 
-fn search(q: &str) -> Vec<Item> {
-    let apps = apps();
+fn search(apps: &[crate::platform::Application], q: &str) -> Vec<Item> {
     let mut out = vec![];
     if let Some(v) = logic::calc(q) {
         out.push(Item::Calc(logic::format_number(v)));
@@ -157,12 +180,14 @@ fn show() {
                 hits: vec![],
                 hover: None,
                 pending_high: None,
+                apps: Arc::new(Vec::new()),
             })
         });
         {
             let _g = APPS.lock(); // pairs with the warm thread (see `warm`); released before update()
             OPEN_HWND.store(h.0 as isize, Ordering::Release);
         }
+        refresh_if_stale();
         update();
         let _ = ShowWindow(h, SW_SHOW);
         crate::runtime::bring_to_front(h);
@@ -173,7 +198,8 @@ fn update() {
     L.with(|l| {
         let mut b = l.borrow_mut();
         let Some(s) = b.as_mut() else { return };
-        s.items = search(&s.query);
+        s.apps = apps();
+        s.items = search(&s.apps, &s.query);
         s.sel = s.sel.min(s.items.len().saturating_sub(1));
     });
     paint();
@@ -203,9 +229,8 @@ fn paint() {
                 SWP_NOACTIVATE,
             );
         }
-        let apps = apps();
         let mut hits = vec![];
-        let _ = render::present(s.hwnd, pw, ph, k, |c| hits = draw(c, &t, s, &apps));
+        let _ = render::present(s.hwnd, pw, ph, k, |c| hits = draw(c, &t, s, &s.apps));
         s.hits = hits;
     });
 }
@@ -217,7 +242,12 @@ fn draw(
     apps: &[crate::platform::Application],
 ) -> Vec<(Rect, usize)> {
     let card = Rect::new(24., 8., W, height(s.items.len()));
-    for (d, a) in [(16., 0.10), (8., 0.16), (3., 0.22)] {
+    let shadow: &[(f32, f32)] = if t.glass {
+        &[]
+    } else {
+        &[(16., 0.10), (8., 0.16), (3., 0.22)]
+    };
+    for &(d, a) in shadow {
         c.fill_round(
             Rect::new(
                 card.x - d / 2.,
@@ -296,7 +326,9 @@ fn draw(
         let (title, sub): (String, &str) = match it {
             Item::App(ix) => {
                 let Some(a) = apps.get(*ix) else { continue };
-                match crate::appicons::for_path(&a.path.to_string_lossy()) {
+                // Store app icons load in the background (glyph until WM_ICON_READY repaints)
+                let path = a.path.to_string_lossy();
+                match crate::appicons::for_path_deferred(&path, s.hwnd, WM_ICON_READY) {
                     Some(Image { rgba, w, h }) => c.image(&rgba, w, h, ic, 1.),
                     None => c.icon("app", ic.inset(2.), t.muted, 1.8),
                 }
@@ -344,11 +376,14 @@ fn draw(
 }
 
 fn activate(i: usize) {
-    let item = L.with(|l| l.borrow().as_ref().and_then(|s| s.items.get(i).cloned()));
-    let Some(item) = item else { return };
+    let item = L.with(|l| {
+        l.borrow()
+            .as_ref()
+            .and_then(|s| Some((s.items.get(i).cloned()?, s.apps.clone())))
+    });
+    let Some((item, a)) = item else { return };
     match item {
         Item::App(ix) => {
-            let a = apps();
             if let Some(app) = a.get(ix) {
                 let _ = crate::platform::open(&app.path);
             }
@@ -403,6 +438,10 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
         }
         WM_APPS_READY => {
             update();
+            LRESULT(0)
+        }
+        WM_ICON_READY => {
+            paint();
             LRESULT(0)
         }
         WM_CHAR => {

@@ -21,9 +21,11 @@ pub fn install() -> io::Result<PathBuf> {
     };
     let source = std::env::current_exe()?;
     let dir = install_dir()?;
-    let shortcut_path = known_folder(&FOLDERID_Programs)?.join("Solo Leveling Shell.lnk");
+    let shortcut_path = known_folder(&FOLDERID_Programs)?.join("RustLand.lnk");
     // earlier builds used another Start-menu name
-    let _ = std::fs::remove_file(known_folder(&FOLDERID_Programs)?.join("Monarch Next.lnk"));
+    for old in ["Monarch Next.lnk", "Solo Leveling Shell.lnk"] {
+        let _ = std::fs::remove_file(known_folder(&FOLDERID_Programs)?.join(old));
+    }
     let target = dir.join("MonarchNext.exe");
     let upgrading = target.exists();
     if upgrading {
@@ -105,7 +107,7 @@ fn shortcut(target: &Path, shortcut_path: &Path) -> io::Result<()> {
             let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
             let p = wide(target);
             link.SetPath(PCWSTR(p.as_ptr()))?;
-            link.SetDescription(w!("Solo Leveling Shell"))?;
+            link.SetDescription(w!("RustLand"))?;
             let persist: IPersistFile = windows::core::Interface::cast(&link)?;
             let dest = wide(shortcut_path);
             persist.Save(PCWSTR(dest.as_ptr()), true)
@@ -143,7 +145,7 @@ fn register_uninstall(target: &Path, registry_path: &str) -> io::Result<()> {
         .map_err(io::Error::other)?;
     }
     let result = (|| {
-        set_string(key, "DisplayName", "Solo Leveling Shell")?;
+        set_string(key, "DisplayName", "RustLand")?;
         set_string(key, "DisplayVersion", env!("CARGO_PKG_VERSION"))?;
         set_string(key, "Publisher", "EsamLasheen")?;
         set_string(
@@ -165,6 +167,22 @@ fn register_uninstall(target: &Path, registry_path: &str) -> io::Result<()> {
 }
 
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+
+/// The shell is registered to start at sign-in.
+pub fn autostart_enabled() -> bool {
+    unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            RUN_KEY,
+            w!("MonarchNext"),
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            None,
+        )
+        .is_ok()
+    }
+}
 
 /// Start the shell at sign-in (per user, no scheduled task or service needed).
 pub fn set_autostart(target: &Path, on: bool) -> io::Result<()> {
@@ -283,7 +301,7 @@ fn close_processes_of(exe: &Path) -> io::Result<()> {
                 let _ = CloseHandle(h);
                 if w != WAIT_OBJECT_0 {
                     return Err(io::Error::other(
-                        "Solo Leveling Shell is still running. Close it, then run setup again.",
+                        "RustLand is still running. Close it, then run setup again.",
                     ));
                 }
             }
@@ -327,7 +345,11 @@ pub fn finish_uninstall(parent: u32) -> io::Result<()> {
     if installed.exists() {
         fs::remove_file(installed)?;
     }
-    for name in ["Solo Leveling Shell.lnk", "Monarch Next.lnk"] {
+    for name in [
+        "RustLand.lnk",
+        "Solo Leveling Shell.lnk",
+        "Monarch Next.lnk",
+    ] {
         let shortcut = known_folder(&FOLDERID_Programs)?.join(name);
         if shortcut.exists() {
             fs::remove_file(shortcut)?;

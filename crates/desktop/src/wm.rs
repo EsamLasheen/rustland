@@ -67,6 +67,9 @@ const BACKLOG_CAP: usize = 256;
 const MIN_FLOAT_SIZE: i32 = 100;
 /// A window that refuses its tile is re-laid out at most this often (2x/s).
 const REFIT_INTERVAL: Duration = Duration::from_millis(500);
+/// A window may pull itself out of its tile this often per [`SNAP_WINDOW`] before we give up.
+const SNAP_LIMIT: u8 = 4;
+const SNAP_WINDOW: Duration = Duration::from_secs(3);
 /// Bounded rounds of effect execution per event (effects may produce effects).
 const FLUSH_ROUNDS: usize = 4;
 const JOURNAL_FILE: &str = "wm-hidden.json";
@@ -743,6 +746,22 @@ unsafe extern "system" fn collect_monitor(m: HMONITOR, _dc: HDC, _r: *mut RECT, 
     BOOL(1)
 }
 
+/// The window covers its whole monitor, taskbar area included (borderless fullscreen).
+unsafe fn covers_monitor(h: HWND) -> bool {
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let mut wr = RECT::default();
+    if !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut info).as_bool()
+        || GetWindowRect(h, &mut wr).is_err()
+    {
+        return false;
+    }
+    let m = info.rcMonitor;
+    wr.left <= m.left && wr.top <= m.top && wr.right >= m.right && wr.bottom >= m.bottom
+}
+
 /// Monitors (handle, work area) with the primary first, then left to right.
 unsafe fn read_monitors() -> Vec<(isize, Rect)> {
     let mut list: Vec<(isize, Rect, bool)> = Vec::new();
@@ -801,6 +820,8 @@ struct Engine {
     pending: HashMap<isize, Rect>,
     /// Last visual rect requested per window (to detect windows refusing their tile).
     placed: HashMap<isize, Rect>,
+    /// Re-placements of windows that moved themselves out of their tile: (window start, count).
+    snaps: HashMap<isize, (Instant, u8)>,
     /// Last min-size re-layout per window (rate limit).
     refit: HashMap<isize, Instant>,
     out: Vec<Effect>,
@@ -831,6 +852,7 @@ impl Engine {
             pending: HashMap::new(),
             placed: HashMap::new(),
             refit: HashMap::new(),
+            snaps: HashMap::new(),
             out: Vec::with_capacity(64),
             drag: None,
             movesize: None,
@@ -884,6 +906,7 @@ impl Engine {
         self.pending.remove(&key);
         self.placed.remove(&key);
         self.refit.remove(&key);
+        self.snaps.remove(&key);
     }
 
     /// Shell, desktop and our own surfaces are never targets of window actions.
@@ -1052,7 +1075,13 @@ impl Engine {
                 floating: disposition == Disposition::Float,
                 workspace: owner.map(|(_, ws)| ws),
             },
-            self.started.elapsed(),
+            // The startup grace keeps login apps from yanking the view to their workspace; a
+            // window the user brought to the front (launched or clicked) is always followed.
+            if GetForegroundWindow() == h {
+                Duration::MAX
+            } else {
+                self.started.elapsed()
+            },
             &mut self.out,
         );
         if managed && IsZoomed(h).as_bool() {
@@ -1066,6 +1095,17 @@ impl Engine {
         let h = hwnd(key);
         let wid = id(h);
         let managed = self.model.window(wid).is_some();
+        if managed && event != EVENT_OBJECT_LOCATIONCHANGE && crate::runtime::debug_enabled() {
+            if let Ok(p) = crate::platform::paths() {
+                crate::platform::log(
+                    &p,
+                    &format!(
+                        "wm event {event:#x} {key} suppressed={}",
+                        self.is_suppressed(key)
+                    ),
+                );
+            }
+        }
         match event {
             EVENT_OBJECT_LOCATIONCHANGE => {
                 if !managed {
@@ -1078,7 +1118,8 @@ impl Engine {
                 if let Some(r) = self.pending.remove(&key) {
                     self.place(h, r);
                 }
-                let zoomed = IsZoomed(h).as_bool();
+                // Fullscreen (F11, video, games) is left alone like a maximized window.
+                let zoomed = IsZoomed(h).as_bool() || covers_monitor(h);
                 if self
                     .model
                     .window(wid)
@@ -1088,6 +1129,7 @@ impl Engine {
                 }
                 if !zoomed {
                     self.check_min_size(h);
+                    self.snap_back(h);
                 }
             }
             EVENT_SYSTEM_FOREGROUND => {
@@ -1293,6 +1335,45 @@ impl Engine {
             return;
         }
         let now = Instant::now();
+        // Apps that restore a saved size right after opening (Notepad, Electron) also grow
+        // from the requested origin: place once more before believing it is a minimum.
+        if !self
+            .snaps
+            .get(&key)
+            .is_some_and(|(t, _)| now.duration_since(*t) < SNAP_WINDOW)
+        {
+            self.snaps.insert(key, (now, 1));
+            self.place(h, placed);
+            return;
+        }
+        // A "minimum" that is most of the monitor is a restored size, not a real limit.
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+        let (width, height) = if GetMonitorInfoW(mon, &mut info).as_bool() {
+            let work = to_rect(info.rcWork);
+            (
+                if width * 4 > work.width * 3 { 0 } else { width },
+                if height * 4 > work.height * 3 {
+                    0
+                } else {
+                    height
+                },
+            )
+        } else {
+            (width, height)
+        };
+        if width == 0 && height == 0 {
+            if let Some((t, n)) = self.snaps.get(&key).copied() {
+                if n < SNAP_LIMIT {
+                    self.snaps.insert(key, (t, n + 1));
+                    self.place(h, placed);
+                }
+            }
+            return;
+        }
         if self
             .refit
             .get(&key)
@@ -1306,6 +1387,40 @@ impl Engine {
         }
         self.refit.insert(key, now);
         self.model.set_min_size(wid, width, height, &mut self.out);
+    }
+
+    /// A tiled window that moved itself away from its tile (WinUI apps such as Notepad restore
+    /// their saved position just after opening) is put back, a few times at most.
+    unsafe fn snap_back(&mut self, h: HWND) {
+        let (key, wid) = (h.0 as isize, id(h));
+        if self.drag.is_some_and(|d| d.hwnd == key)
+            || self.movesize.is_some_and(|m| m.hwnd == key)
+            || !self.model.is_tiled(wid)
+            || !self.model.is_visible(wid)
+        {
+            return;
+        }
+        let (Some(placed), Some((_, vr))) = (self.placed.get(&key).copied(), frame(h)) else {
+            return;
+        };
+        let v = to_rect(vr);
+        if (v.x - placed.x).abs() <= 2 && (v.y - placed.y).abs() <= 2 {
+            return;
+        }
+        let now = Instant::now();
+        let (since, n) = match self.snaps.get(&key) {
+            Some((t, n)) if now.duration_since(*t) < SNAP_WINDOW => (*t, *n),
+            _ => (now, 0),
+        };
+        if n >= SNAP_LIMIT {
+            return;
+        }
+        if self.snaps.len() >= MAX_WINDOWS {
+            self.snaps
+                .retain(|_, (t, _)| now.duration_since(*t) < SNAP_WINDOW);
+        }
+        self.snaps.insert(key, (since, n + 1));
+        self.place(h, placed);
     }
 
     unsafe fn drag_begin(&mut self, key: isize, start: (i32, i32), kind: DragKind) {
@@ -1444,8 +1559,20 @@ impl Engine {
                 break;
             }
             let mut effects = std::mem::take(&mut self.out);
+            // Hiding the focused window must not leave the keyboard in a minimized window: if
+            // nothing else is focused in this batch, the desktop takes it.
+            let fg = id(GetForegroundWindow());
+            let hides_fg = effects
+                .iter()
+                .any(|e| matches!(e, Effect::Hide(w) if *w == fg));
+            let focuses = effects
+                .iter()
+                .any(|e| matches!(e, Effect::Focus(_) | Effect::Restore(_)));
             for e in effects.drain(..) {
                 self.execute(e);
+            }
+            if hides_fg && !focuses {
+                focus(GetShellWindow());
             }
             if self.out.is_empty() {
                 self.out = effects;
@@ -1510,19 +1637,19 @@ impl Engine {
     }
 
     unsafe fn execute(&mut self, e: Effect) {
+        if crate::runtime::debug_enabled() {
+            if let Ok(p) = crate::platform::paths() {
+                crate::platform::log(&p, &format!("wm {e:?}"));
+            }
+        }
         match e {
             Effect::Place(w, r) => self.place(hwnd(w as isize), r),
             Effect::Hide(w) => {
                 self.suppress(w as isize);
                 let h = hwnd(w as isize);
-                // A hidden window must not keep keyboard focus (e.g. when switching to an
-                // empty workspace): SW_MINIMIZE also activates the next window.
-                let cmd = if GetForegroundWindow() == h {
-                    SW_MINIMIZE
-                } else {
-                    SW_SHOWMINNOACTIVE
-                };
-                let _ = ShowWindowAsync(h, cmd);
+                // Never activates another window (that could be one being hidden in the same
+                // batch); the batch hands focus on afterwards.
+                let _ = ShowWindowAsync(h, SW_SHOWMINNOACTIVE);
             }
             Effect::Show(w) => {
                 self.suppress(w as isize);
@@ -1596,7 +1723,6 @@ impl Engine {
     }
 
     unsafe fn set_pos(&mut self, h: HWND, r: Rect, i: Insets) {
-        self.suppress(h.0 as isize);
         let _ = SetWindowPos(
             h,
             None,

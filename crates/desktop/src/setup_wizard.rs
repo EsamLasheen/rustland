@@ -179,7 +179,7 @@ unsafe fn build(h: HWND) {
         )
     };
 
-    label(y, "Solo Leveling Shell  ·  سولو ليفلينج", bold);
+    label(y, "RustLand  ·  راست لاند", bold);
     y += s(26);
     label(
         y,
@@ -289,7 +289,7 @@ unsafe fn build(h: HWND) {
     check(
         y,
         ID_ACCENT,
-        "Take the accent colour from the wallpaper  ·  لون من الخلفية",
+        "Theme colours from the wallpaper (Material You)  ·  ألوان من الخلفية",
         cfg.dynamic_accent,
     );
     y += s(28);
@@ -297,7 +297,9 @@ unsafe fn build(h: HWND) {
         y,
         ID_AUTOSTART,
         "Start when I sign in  ·  التشغيل مع ويندوز",
-        true,
+        // an update keeps the user's choice; a first install starts with it on
+        crate::setup::autostart_enabled()
+            || !crate::setup::install_dir().is_ok_and(|d| d.join("MonarchNext.exe").exists()),
     );
     y += s(44);
 
@@ -461,9 +463,9 @@ pub fn ask(update: bool) -> Option<Choices> {
             ..Default::default()
         });
         let title = if update {
-            w!("Update Solo Leveling Shell")
+            w!("Update RustLand")
         } else {
-            w!("Install Solo Leveling Shell")
+            w!("Install RustLand")
         };
         let h = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -505,8 +507,21 @@ pub fn ask(update: bool) -> Option<Choices> {
 
 /// Save the answers and prepare the wallpaper folders (one per rank).
 pub fn apply(c: &Choices) -> std::io::Result<()> {
+    // re-read: the shell may have changed settings (wallpaper, colours, toggles) while the
+    // questions were open; only what the wizard asks about is taken from the answers
     let mut store = Store::open()?;
-    store.config = c.config.clone();
+    let a = &c.config;
+    let s = &mut store.config;
+    s.user_name = a.user_name.clone();
+    s.rank_folders = a.rank_folders.clone();
+    s.weather_city = a.weather_city.clone();
+    s.focus_file = a.focus_file.clone();
+    s.rank = a.rank;
+    s.accent = a.accent.clone();
+    s.window_manager = a.window_manager;
+    s.hide_taskbar = a.hide_taskbar;
+    s.wallpaper_engine = a.wallpaper_engine;
+    s.dynamic_accent = a.dynamic_accent;
     store.save()?;
     let root = if c.config.rank_folders.trim().is_empty() {
         crate::wallpaper::default_rank_root()

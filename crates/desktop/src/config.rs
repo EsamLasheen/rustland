@@ -29,6 +29,8 @@ pub struct ShellConfig {
     pub last_rotation_ms: u64,
     /// Obsidian focus-timer state file (optional; empty = no focus timer).
     pub focus_file: String,
+    /// Material You source colour of the current wallpaper (dynamic colours; empty = none).
+    pub seed: String,
     /// Name used in the dashboard greeting (empty = no name).
     pub user_name: String,
     /// Tile and manage windows (workspaces, rules, focus-follows-mouse).
@@ -37,6 +39,8 @@ pub struct ShellConfig {
     pub hide_taskbar: bool,
     /// Wallpaper, clock layer and active-window glow.
     pub wallpaper_engine: bool,
+    /// Frosted-glass surfaces (blur of the desktop behind the bar, capsule and panels).
+    pub glass: bool,
 }
 
 impl Default for ShellConfig {
@@ -49,7 +53,7 @@ impl Default for ShellConfig {
             preset: "ShadowMonarch".into(),
             reduce_motion: false,
             leftbar_autohide: true,
-            focus_pulse: "breath".into(),
+            focus_pulse: "static".into(), // the breathing glow ticks 12x/s: opt-in
             rotate_enabled: true,
             rotate_hours: 3.,
             rank_folders: String::new(),
@@ -59,10 +63,12 @@ impl Default for ShellConfig {
             follow_new_windows: true,
             last_rotation_ms: 0,
             focus_file: String::new(),
+            seed: String::new(),
             user_name: String::new(),
             window_manager: true,
             hide_taskbar: true,
             wallpaper_engine: true,
+            glass: false,
         }
     }
 }

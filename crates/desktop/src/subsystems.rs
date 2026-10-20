@@ -544,6 +544,14 @@ pub fn rotate_wallpaper() {
         }
     });
 }
+/// Apply the rotation settings to the running engine (no restart needed).
+pub fn set_rotation(enabled: bool, hours: f32) {
+    S.with(|s| {
+        if let Some(w) = &s.borrow().wall {
+            w.set_rotation(if enabled { hours } else { 0. });
+        }
+    });
+}
 pub fn set_accent(c: Color, rank: char) {
     S.with(|s| {
         let s = s.borrow();
@@ -567,7 +575,7 @@ pub fn set_glow_mode(m: &str) {
 /// Wallpaper thumbnails for the dashboard: decoded off the UI thread, delivered via WM_THUMBS.
 pub fn load_wallpapers(root: HWND, cfg: &ShellConfig) {
     let Some(rr) = rank_root(cfg) else { return };
-    let dir = wallpaper::rank_dir(&rr, cfg.rank);
+    let dir = wallpaper::images_dir(&rr, cfg.rank);
     let current = (!cfg.wallpaper.is_empty()).then(|| PathBuf::from(&cfg.wallpaper));
     let raw = root.0 as isize;
     std::thread::spawn(move || {
@@ -626,15 +634,18 @@ pub fn take_thumbs(
     (list, v.banner.map(|b| image(b, BANNER.0, BANNER.1)))
 }
 
-/// Wallpaper events → (image now shown, accent to adopt, rotation timestamp to persist).
-pub fn take_wallpaper_event(l: LPARAM) -> Option<(Option<PathBuf>, Option<Color>, Option<u64>)> {
+/// Wallpaper events → (image now shown, its Material source colour, rotation timestamp to persist).
+/// (image now shown, its Material source colour, rotation time to persist)
+pub type Shown = (Option<PathBuf>, Option<[u8; 3]>, Option<u64>);
+pub fn take_wallpaper_event(l: LPARAM) -> Option<Shown> {
     match unsafe { *Box::from_raw(l.0 as *mut wallpaper::Event) } {
         wallpaper::Event::Applied {
             image,
-            accent,
+            seed,
             rotated,
             at_ms,
-        } => Some((image, accent, rotated.then_some(at_ms))),
+            ..
+        } => Some((image, seed, rotated.then_some(at_ms))),
         wallpaper::Event::Failed { image, error } => {
             log(&format!("wallpaper {}: {error}", image.display()));
             None

@@ -1,6 +1,11 @@
 //! Window / application icons as RGBA (top bar active window, workspace apps). Cached per exe, bounded.
 use crate::topbar::Image;
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+    sync::{mpsc, Mutex, OnceLock},
+};
 use windows::{
     core::PCWSTR,
     Win32::{
@@ -40,6 +45,14 @@ pub fn exe_of(h: HWND) -> Option<String> {
 
 /// HICON → straight RGBA. `owned`: we extracted it and must destroy it.
 unsafe fn hicon_rgba(icon: HICON, owned: bool) -> Option<Image> {
+    hicon_pixels(icon, owned).map(|(px, w, h)| Image {
+        rgba: Rc::new(px),
+        w,
+        h,
+    })
+}
+/// HICON → (straight RGBA pixels, width, height); plain data, so it can cross threads.
+unsafe fn hicon_pixels(icon: HICON, owned: bool) -> Option<(Vec<u8>, u32, u32)> {
     let mut ii = ICONINFO::default();
     if GetIconInfo(icon, &mut ii).is_err() {
         if owned {
@@ -107,11 +120,7 @@ unsafe fn hicon_rgba(icon: HICON, owned: bool) -> Option<Image> {
     for p in px.as_chunks_mut::<4>().0 {
         p.swap(0, 2);
     } // BGRA -> RGBA
-    Some(Image {
-        rgba: Rc::new(px),
-        w: w as u32,
-        h: h as u32,
-    })
+    Some((px, w as u32, h as u32))
 }
 
 unsafe fn from_window(h: HWND) -> Option<Image> {
@@ -186,35 +195,142 @@ pub fn for_window(h: HWND) -> Option<Image> {
     img
 }
 
-/// Icon of a file or shortcut as Explorer shows it (resolves .lnk targets and overlays), cached.
-pub fn for_path(path: &str) -> Option<Image> {
+/// Explorer's large icon for a file, shortcut, or shell namespace item (`shell:AppsFolder\<AUMID>`,
+/// i.e. Store apps), as plain pixels. Shell items cost 100–300 ms; files are usually much cheaper.
+unsafe fn path_pixels(path: &str) -> Option<(Vec<u8>, u32, u32)> {
     use windows::Win32::{Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES, UI::Shell::*};
-    let key = format!("path:{}", path.to_lowercase());
-    if let Some(hit) = PATHS.with(|c| c.borrow().get(&key).cloned()) {
-        return hit;
-    }
-    let img = unsafe {
-        let w = crate::platform::wide(path);
-        let mut info = SHFILEINFOW::default();
-        let ok = SHGetFileInfoW(
-            PCWSTR(w.as_ptr()),
+    let w = crate::platform::wide(path);
+    let mut info = SHFILEINFOW::default();
+    // Shell namespace items are not files: resolve them to an item ID list and ask for that
+    // item's icon instead.
+    let mut pidl: *mut Common::ITEMIDLIST = std::ptr::null_mut();
+    let (name, flags) = if path.starts_with("shell:") {
+        let _ = SHParseDisplayName(PCWSTR(w.as_ptr()), None, &mut pidl, 0, None);
+        (PCWSTR(pidl as *const u16), SHGFI_PIDL)
+    } else {
+        (PCWSTR(w.as_ptr()), SHGFI_FLAGS(0))
+    };
+    let ok = if name.is_null() {
+        0 // unresolvable shell item: no icon (callers draw their glyph)
+    } else {
+        SHGetFileInfoW(
+            name,
             FILE_FLAGS_AND_ATTRIBUTES(0),
             Some(&mut info),
             std::mem::size_of::<SHFILEINFOW>() as u32,
-            SHGFI_ICON | SHGFI_LARGEICON,
-        );
-        if ok != 0 && !info.hIcon.is_invalid() {
-            hicon_rgba(info.hIcon, true)
-        } else {
-            None
-        }
+            SHGFI_ICON | SHGFI_LARGEICON | flags,
+        )
     };
+    if !pidl.is_null() {
+        windows::Win32::System::Com::CoTaskMemFree(Some(pidl as *const _));
+    }
+    if ok != 0 && !info.hIcon.is_invalid() {
+        hicon_pixels(info.hIcon, true)
+    } else {
+        None
+    }
+}
+fn remember(key: String, img: Option<Image>) {
     PATHS.with(|c| {
         let mut c = c.borrow_mut();
         if c.len() > 256 {
             c.clear();
         }
-        c.insert(key, img.clone());
+        c.insert(key, img);
     });
+}
+
+/// Icon of a file or shortcut as Explorer shows it (resolves .lnk targets and overlays), cached.
+pub fn for_path(path: &str) -> Option<Image> {
+    let key = format!("path:{}", path.to_lowercase());
+    if let Some(hit) = PATHS.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let img = unsafe { path_pixels(path) }.map(|(px, w, h)| Image {
+        rgba: Rc::new(px),
+        w,
+        h,
+    });
+    remember(key, img.clone());
     img
+}
+
+type Pixels = Option<(Vec<u8>, u32, u32)>;
+/// Shell-item icon requests handed to the worker, keyed like `PATHS`.
+#[derive(Default)]
+struct Deferred {
+    /// Requested and not finished yet (so repaints do not queue them again).
+    pending: HashSet<String>,
+    /// Extracted by the worker, waiting to be picked up by the UI thread.
+    done: HashMap<String, Pixels>,
+}
+static DEFERRED: Mutex<Option<Deferred>> = Mutex::new(None);
+/// A request to the icon worker: (path, cache key, window to notify, message to post).
+type IconRequest = (String, String, isize, u32);
+static DEFERRED_TX: OnceLock<Mutex<mpsc::Sender<IconRequest>>> = OnceLock::new();
+
+/// Like `for_path`, but shell namespace items (Store apps, slow to resolve) are extracted on a
+/// background thread so the caller never stalls: `None` until ready, then `notify` receives `msg`
+/// and the next call returns the icon. Files and shortcuts are resolved inline as in `for_path`.
+pub fn for_path_deferred(path: &str, notify: HWND, msg: u32) -> Option<Image> {
+    if !path.starts_with("shell:") {
+        return for_path(path);
+    }
+    let key = format!("path:{}", path.to_lowercase());
+    if let Some(hit) = PATHS.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let mut d = DEFERRED.lock().ok()?;
+    let d = d.get_or_insert_with(Deferred::default);
+    match d.done.remove(&key) {
+        Some(Some((px, w, h))) => {
+            let img = Some(Image {
+                rgba: Rc::new(px),
+                w,
+                h,
+            });
+            remember(key, img.clone());
+            img
+        }
+        Some(None) => {
+            remember(key, None);
+            None
+        }
+        None if d.pending.contains(&key) => None,
+        None => {
+            if d.pending.len() > 256 {
+                d.pending.clear(); // bounded; a cleared request is at worst queued twice
+            }
+            d.pending.insert(key.clone());
+            let tx = DEFERRED_TX.get_or_init(|| {
+                let (tx, rx) = mpsc::channel::<IconRequest>();
+                let _ = std::thread::Builder::new()
+                    .name("launcher-icons".into())
+                    .spawn(move || unsafe {
+                        let _ = windows::Win32::System::Com::CoInitializeEx(
+                            None,
+                            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+                        );
+                        for (path, key, h, msg) in rx {
+                            let px = path_pixels(&path);
+                            if let Ok(mut g) = DEFERRED.lock() {
+                                let d = g.get_or_insert_with(Deferred::default);
+                                d.pending.remove(&key);
+                                if d.done.len() > 64 {
+                                    d.done.clear(); // never picked up (launcher closed)
+                                }
+                                d.done.insert(key, px);
+                            }
+                            let _ =
+                                PostMessageW(Some(HWND(h as *mut _)), msg, WPARAM(0), LPARAM(0));
+                        }
+                    });
+                Mutex::new(tx)
+            });
+            if let Ok(tx) = tx.lock() {
+                let _ = tx.send((path.to_string(), key, notify.0 as isize, msg));
+            }
+            None
+        }
+    }
 }

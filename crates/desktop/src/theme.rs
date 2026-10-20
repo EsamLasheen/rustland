@@ -17,6 +17,8 @@ pub struct Tokens {
     pub line: Color,
     pub line_soft: Color,
     pub accent_soft: Color,
+    /// Translucent "glass" material: surfaces skip shadows/solid fills (see [`Tokens::glassy`]).
+    pub glass: bool,
 }
 
 pub const R: f32 = 12.; // --r (elementRadius)
@@ -42,8 +44,32 @@ impl Tokens {
             line: accent.mix(clear, 0.30),
             line_soft: accent.mix(clear, 0.14),
             accent_soft: accent.mix(clear, 0.16),
+            glass: false,
         }
     }
+}
+
+impl Tokens {
+    /// The whole theme from a Material You dark scheme (generated from the wallpaper's source colour):
+    /// background and every surface layer, text, borders, accent and alert colour.
+    pub fn from_scheme(s: &monarch_core::material::Scheme) -> Self {
+        let c = |v: [u8; 3]| Color::rgb(v[0], v[1], v[2]);
+        let mut t = Self::new(c(s.primary));
+        t.bg = c(s.background);
+        t.surface = with_alpha(c(s.surface), 0.86);
+        t.surface2 = with_alpha(c(s.surface_high), 0.90);
+        t.surface_solid = with_alpha(c(s.surface_low), 0.95);
+        t.surface_hover = with_alpha(c(s.surface_highest), 0.92);
+        t.text = c(s.on_surface);
+        t.muted = c(s.on_surface_variant);
+        t.faint = c(s.outline_variant);
+        t.warning = c(s.error);
+        t
+    }
+}
+
+fn with_alpha(c: Color, a: f32) -> Color {
+    Color { a, ..c }
 }
 
 fn to_linear(c: f32) -> f32 {
@@ -93,4 +119,24 @@ pub const fn body(size: f32, weight: i32) -> Font {
 }
 pub const fn head(size: f32, weight: i32) -> Font {
     Font::new(Face::Head, size, weight)
+}
+
+impl Tokens {
+    /// Apple-like glass material: light tints over the frosted desktop, slightly lifted toward
+    /// white so cards read as panes of glass, and hairline edges that catch the light.
+    pub fn glassy(mut self) -> Self {
+        let white = Color::rgba(255, 255, 255, 1.);
+        let pane = |c: Color, a: f32| Color {
+            a,
+            ..c.mix(white, 0.90)
+        };
+        self.surface = pane(self.surface, 0.18);
+        self.surface2 = pane(self.surface2, 0.14);
+        self.surface_solid = pane(self.surface_solid, 0.22);
+        self.surface_hover = pane(self.surface_hover, 0.30);
+        self.line = Color::rgba(255, 255, 255, 0.16).mix(self.line, 0.6);
+        self.line_soft = Color::rgba(255, 255, 255, 0.10).mix(self.line_soft, 0.6);
+        self.glass = true;
+        self
+    }
 }

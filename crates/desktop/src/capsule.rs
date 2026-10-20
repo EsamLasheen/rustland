@@ -110,6 +110,14 @@ pub struct Palette {
     pub fg: Color,
 }
 pub fn palette(t: &Tokens) -> Palette {
+    if t.glass {
+        // accent-tinted glass with light text instead of a solid accent pill
+        return Palette {
+            bg1: t.accent.alpha(0.42),
+            bg2: oklch_shift(t.accent, -0.06, 48.).alpha(0.30),
+            fg: t.text,
+        };
+    }
     Palette {
         bg1: t.accent,
         bg2: oklch_shift(t.accent, -0.06, 48.),
@@ -208,7 +216,12 @@ pub fn paint_idle(
     let r = Rect::new((win_w - island_w) / 2., 4., island_w, IDLE_H);
     let k = Radii::all(R);
     // shadow: 0 4px 16px rgba(0,0,0,.45) approximated with stacked translucent rounds
-    for (g, a) in [(6., 0.08), (3., 0.12), (1., 0.18)] {
+    let shadow: &[(f32, f32)] = if t.glass {
+        &[]
+    } else {
+        &[(6., 0.08), (3., 0.12), (1., 0.18)]
+    };
+    for &(g, a) in shadow {
         c.fill_round(
             Rect::new(r.x - g, r.y - g + 3., r.w + 2. * g, r.h + 2. * g),
             Radii::all(R + g),
@@ -332,7 +345,13 @@ pub fn paint_card(
     let fg20 = fg.alpha(0.20);
     let fg70 = fg.alpha(0.70);
     let _ = win_w;
-    for (g, a) in [(8., 0.06), (4., 0.10), (1., 0.18)] {
+    // glass: no shadow (it would be frosted into a blurry halo around the card)
+    let shadow: &[(f32, f32)] = if t.glass {
+        &[]
+    } else {
+        &[(8., 0.06), (4., 0.10), (1., 0.18)]
+    };
+    for &(g, a) in shadow {
         c.fill_round(
             Rect::new(
                 frame.x - g,

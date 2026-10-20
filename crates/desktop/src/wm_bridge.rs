@@ -235,11 +235,22 @@ pub fn power(act: &str) {
             "lock" => {
                 let _ = windows::Win32::System::Shutdown::LockWorkStation();
             }
-            "sleep" => {
-                let _ = SetSuspendState(false, false, false);
-            }
-            "hibernate" => {
-                let _ = SetSuspendState(true, false, false);
+            "sleep" | "hibernate" => {
+                let hibernate = act == "hibernate";
+                // SetSuspendState needs the shutdown privilege and returns only after resume:
+                // run it off the UI thread. Modern-standby PCs refuse S3, so turning the
+                // display off (which enters standby there) is the fallback.
+                std::thread::spawn(move || {
+                    enable_shutdown_privilege();
+                    if !SetSuspendState(hibernate, false, false) && !hibernate {
+                        let _ = PostMessageW(
+                            Some(HWND_BROADCAST),
+                            WM_SYSCOMMAND,
+                            WPARAM(SC_MONITORPOWER as usize),
+                            LPARAM(2),
+                        );
+                    }
+                });
             }
             "logout" => {
                 let _ = ExitWindowsEx(EWX_LOGOFF, SHTDN_REASON_MAJOR_OTHER);
@@ -281,7 +292,18 @@ pub fn work_area_changed() {
 
 /// Called from the LL mouse hook for every move: drag tracking first, else focus-follows-mouse.
 pub fn mouse_move(p: POINT) {
-    if DRAG.load(Ordering::Relaxed) != 0 {
+    let drag = DRAG.load(Ordering::Relaxed);
+    if drag != 0 {
+        // The release can be lost (UAC prompt, Ctrl+Alt+Del, hook timeout): end the drag
+        // once the button is up instead of leaving the window glued to the cursor.
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON,
+        };
+        let button = if drag == 2 { VK_RBUTTON } else { VK_LBUTTON };
+        if unsafe { GetAsyncKeyState(button.0 as i32) } >= 0 {
+            drag_end(p, drag == 2);
+            return;
+        }
         wm::drag_update(p.x, p.y);
     } else {
         wm::pointer_moved(p.x, p.y);

@@ -67,10 +67,6 @@ impl Color {
         let p = |i: usize| u8::from_str_radix(s.get(i..i + 2).unwrap_or("ff"), 16).unwrap_or(255);
         Self::rgb(p(1), p(3), p(5))
     }
-    pub fn to_hex(self) -> String {
-        let q = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
-        format!("#{:02x}{:02x}{:02x}", q(self.r), q(self.g), q(self.b))
-    }
     pub fn alpha(self, a: f32) -> Self {
         Self {
             a: self.a * a,
@@ -382,6 +378,13 @@ impl Canvas {
     }
     /// Horizontal linear gradient across `r` (CSS linear-gradient(90deg, stops…)).
     pub fn fill_round_gradient(&self, r: Rect, k: Radii, stops: &[(f32, Color)]) {
+        self.gradient(r, k, stops, false);
+    }
+    /// Top-to-bottom gradient (glass sheen).
+    pub fn fill_round_vgradient(&self, r: Rect, k: Radii, stops: &[(f32, Color)]) {
+        self.gradient(r, k, stops, true);
+    }
+    fn gradient(&self, r: Rect, k: Radii, stops: &[(f32, Color)], vertical: bool) {
         let Ok(g) = self.round_geometry(r, k) else {
             return;
         };
@@ -402,9 +405,16 @@ impl Canvas {
             };
             let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
                 startPoint: windows_numerics::Vector2 { X: r.x, Y: r.y },
-                endPoint: windows_numerics::Vector2 {
-                    X: r.right(),
-                    Y: r.y,
+                endPoint: if vertical {
+                    windows_numerics::Vector2 {
+                        X: r.x,
+                        Y: r.bottom(),
+                    }
+                } else {
+                    windows_numerics::Vector2 {
+                        X: r.right(),
+                        Y: r.y,
+                    }
                 },
             };
             if let Ok(b) = self.rt.CreateLinearGradientBrush(&props, None, &coll) {
@@ -544,7 +554,8 @@ impl Canvas {
             if is_rtl(text) {
                 l.SetReadingDirection(DWRITE_READING_DIRECTION_RIGHT_TO_LEFT)?;
             }
-            if tracking != 0. {
+            // letter-spacing breaks the joins of cursive (Arabic) script
+            if tracking != 0. && !is_rtl(text) {
                 let range = DWRITE_TEXT_RANGE {
                     startPosition: 0,
                     length: w.len() as u32,
@@ -909,6 +920,78 @@ impl Drop for Surface {
     }
 }
 
+// ── glass ────────────────────────────────────────────────────────────────────────────────────
+
+/// Frosted glass on/off for every surface presented from now on.
+static GLASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BACKDROP: std::sync::Mutex<Option<std::sync::Arc<Backdrop>>> = std::sync::Mutex::new(None);
+
+/// The wallpaper, blurred, at 1/`scale` of the screen (opaque BGRA).
+pub struct Backdrop {
+    pub w: usize,
+    pub h: usize,
+    pub scale: usize,
+    pub px: Vec<u8>,
+}
+
+pub fn set_glass(on: bool) {
+    GLASS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_backdrop(b: Option<Backdrop>) {
+    if let Ok(mut g) = BACKDROP.lock() {
+        *g = b.map(std::sync::Arc::new);
+    }
+}
+
+fn backdrop() -> Option<std::sync::Arc<Backdrop>> {
+    BACKDROP.lock().ok()?.clone()
+}
+
+/// Put the blurred wallpaper under the drawn pixels of a premultiplied frame whose top-left sits
+/// at screen (`x0`, `y0`). Translucent fills become frosted glass; fully clear pixels stay clear
+/// and anti-aliased edges keep their coverage.
+fn frost_under(px: &mut [u8], w: usize, h: usize, x0: i32, y0: i32, bd: &Backdrop) {
+    // surfaces are at least this opaque where they are "inside"; below it = edge coverage
+    const FILL: f32 = 0.15 * 255.0;
+    if bd.w == 0 || bd.h == 0 || bd.px.len() < bd.w * bd.h * 4 {
+        return;
+    }
+    let s = bd.scale as f32;
+    let sample = |sx: f32, sy: f32| -> [f32; 3] {
+        let fx = (sx / s - 0.5).clamp(0.0, (bd.w - 1) as f32);
+        let fy = (sy / s - 0.5).clamp(0.0, (bd.h - 1) as f32);
+        let (ix, iy) = (fx as usize, fy as usize);
+        let (jx, jy) = ((ix + 1).min(bd.w - 1), (iy + 1).min(bd.h - 1));
+        let (tx, ty) = (fx - ix as f32, fy - iy as f32);
+        let at = |x: usize, y: usize, c: usize| bd.px[(y * bd.w + x) * 4 + c] as f32;
+        let mut o = [0.0; 3];
+        for (c, v) in o.iter_mut().enumerate() {
+            let top = at(ix, iy, c) * (1.0 - tx) + at(jx, iy, c) * tx;
+            let bot = at(ix, jy, c) * (1.0 - tx) + at(jx, jy, c) * tx;
+            *v = top * (1.0 - ty) + bot * ty;
+        }
+        o
+    };
+    for y in 0..h {
+        for x in 0..w {
+            let o = (y * w + x) * 4;
+            let a = px[o + 3] as f32;
+            if a == 0.0 {
+                continue;
+            }
+            let cov = (a / FILL).min(1.0);
+            let b = sample(x0 as f32 + x as f32, y0 as f32 + y as f32);
+            for c in 0..3 {
+                px[o + c] = (px[o + c] as f32 + b[c] * (cov - a / 255.0).max(0.0))
+                    .round()
+                    .min(255.0) as u8;
+            }
+            px[o + 3] = (cov * 255.0).round() as u8;
+        }
+    }
+}
+
 pub fn present(h: HWND, w: i32, ht: i32, scale: f32, paint: impl FnOnce(&Canvas)) -> Result<()> {
     if w <= 0 || ht <= 0 {
         return Ok(()); // destroyed or not yet sized: nothing to draw, nothing to allocate
@@ -974,6 +1057,12 @@ pub fn present(h: HWND, w: i32, ht: i32, scale: f32, paint: impl FnOnce(&Canvas)
         let r = rt.EndDraw(None, None);
         let mut wr = RECT::default();
         let _ = GetWindowRect(h, &mut wr);
+        if GLASS.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(bd) = backdrop() {
+                let px = std::slice::from_raw_parts_mut(bits as *mut u8, (w * ht * 4) as usize);
+                frost_under(px, w as usize, ht as usize, wr.left, wr.top, &bd);
+            }
+        }
         let pos = POINT {
             x: wr.left,
             y: wr.top,

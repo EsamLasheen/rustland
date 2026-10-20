@@ -372,6 +372,16 @@ unsafe extern "system" fn kb(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     let Some(b) = find(mods, vk) else {
         return CallNextHookEx(None, code, w, l);
     };
+    // Without our window manager, tiling keys stay Windows' (Snap, Win+1..0 taskbar apps);
+    // only the verbs that have a plain Win32 fallback are taken.
+    let wm_only = match b.act {
+        Act::Wm(v) => !matches!(v, "close" | "minimize" | "toggle-maximize" | "unminimize"),
+        Act::WmIndexed(..) => true,
+        _ => false,
+    };
+    if wm_only && !crate::wm::is_running() {
+        return CallNextHookEx(None, code, w, l);
+    }
     word.fetch_or(bit, Ordering::Relaxed);
     WIN_USED.store(true, Ordering::Relaxed);
     crate::runtime::post_cmd(to_cmd(b.act));

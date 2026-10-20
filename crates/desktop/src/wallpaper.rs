@@ -187,6 +187,17 @@ pub fn rank_dir(root: &Path, rank: char) -> PathBuf {
     root.join(normalize_rank(rank).to_string())
 }
 
+/// Folder the wallpapers are taken from: the rank's sub-folder when it holds images, otherwise the
+/// root itself — so a plain folder of images works without any E…S structure.
+pub fn images_dir(root: &Path, rank: char) -> PathBuf {
+    let ranked = rank_dir(root, rank);
+    if list_images(&ranked).is_empty() && !list_images(root).is_empty() {
+        root.to_path_buf()
+    } else {
+        ranked
+    }
+}
+
 /// A wallpaper candidate: known image extension and not a `_depth` layer.
 pub fn is_image_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
@@ -307,7 +318,7 @@ impl Rotation {
         let next = self
             .root
             .as_ref()
-            .and_then(|r| next_in_folder(&rank_dir(r, rank), current));
+            .and_then(|r| next_in_folder(&images_dir(r, rank), current));
         if next.is_some() || scheduled {
             self.last = now_ms;
         }
@@ -363,6 +374,10 @@ fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
 /// 64×40 grid, colours are binned by hue (24 bins of 15°) weighted by saturation and mid lightness,
 /// and the winning bin's mean is clamped to glow on the navy theme (S 0.65–0.92, L 0.62–0.70).
 /// `None` for grey / dark images (keep the rank colour) or a short buffer.
+use monarch_core::material;
+fn color_of(c: [u8; 3]) -> Color {
+    Color::rgb(c[0], c[1], c[2])
+}
 pub fn accent_of(rgba: &[u8], w: u32, h: u32) -> Option<Color> {
     accent_from(rgba, w as usize, h as usize, false)
 }
@@ -664,6 +679,54 @@ fn frost_of(small: &Small) -> Small {
     out
 }
 
+/// Downscale of the frame used as the glass backdrop (1/4: clear enough to read shapes through
+/// the glass, ~170 KB at 1080p).
+const GLASS_SCALE: usize = 4;
+
+/// Backdrop for the shell's glass surfaces, "crystal" style: the frame box-averaged to 1/4,
+/// a light blur (σ 1.6 cells ≈ 6 px) so shapes stay recognisable through the glass, colours a
+/// little more saturated (vibrancy) and barely dimmed.
+fn glass_of(frame: &[u8], w: usize, h: usize) -> render::Backdrop {
+    const S: usize = GLASS_SCALE;
+    let (sw, sh) = (w.div_ceil(S), h.div_ceil(S));
+    let mut planes = vec![vec![0f32; sw * sh]; 3];
+    if w > 0 && h > 0 && frame.len() >= w * h * 4 {
+        for sy in 0..sh {
+            let (ya, yb) = (sy * S, ((sy + 1) * S).min(h));
+            for sx in 0..sw {
+                let (xa, xb) = (sx * S, ((sx + 1) * S).min(w));
+                let mut acc = [0f32; 3];
+                for y in ya..yb {
+                    for p in frame[(y * w + xa) * 4..(y * w + xb) * 4].as_chunks::<4>().0 {
+                        for (a, v) in acc.iter_mut().zip(&p[..3]) {
+                            *a += *v as f32;
+                        }
+                    }
+                }
+                let n = ((yb - ya) * (xb - xa)) as f32;
+                for (plane, a) in planes.iter_mut().zip(acc) {
+                    plane[sy * sw + sx] = a / n;
+                }
+            }
+        }
+    }
+    let blurred: Vec<Vec<f32>> = planes.iter().map(|p| blur_mask(p, sw, sh, 1.6)).collect();
+    let mut px = vec![255u8; sw * sh * 4];
+    for (i, o) in px.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let (b, g, r) = (blurred[0][i], blurred[1][i], blurred[2][i]);
+        let luma = 0.0722 * b + 0.7152 * g + 0.2126 * r;
+        for (c, v) in [b, g, r].into_iter().enumerate() {
+            o[c] = ((luma + (v - luma) * 1.3) * 0.94).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    render::Backdrop {
+        w: sw,
+        h: sh,
+        scale: S,
+        px,
+    }
+}
+
 // ── clock layout (DesktopClock.qml) ─────────────────────────────────────────
 
 struct Line {
@@ -838,6 +901,35 @@ fn clock_crop(w: usize, h: usize, wide: bool) -> Crop {
 }
 
 // ── WIC ─────────────────────────────────────────────────────────────────────
+
+/// Mirror the image into the Windows wallpaper. Builds where no desktop child window is composed
+/// (Progman children render nothing on some 24H2+ builds) still show the right picture, and the
+/// lock-free Explorer path costs nothing at runtime.
+fn set_system_wallpaper(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe {
+        // "Fill" (cover), like our own frame, so the glass backdrop lines up with the picture
+        use windows::Win32::System::Registry::{RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ};
+        for (name, value) in [(w!("WallpaperStyle"), "10"), (w!("TileWallpaper"), "0")] {
+            let v: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
+            let _ = RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                w!("Control Panel\\Desktop"),
+                name,
+                REG_SZ.0,
+                Some(v.as_ptr().cast()),
+                (v.len() * 2) as u32,
+            );
+        }
+        let _ = SystemParametersInfoW(
+            SPI_SETDESKWALLPAPER,
+            0,
+            Some(wide.as_mut_ptr().cast()),
+            SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+        );
+    }
+}
 
 fn io_err(e: windows::core::Error) -> io::Error {
     io::Error::other(e)
@@ -1072,7 +1164,7 @@ fn compose_depth(
 }
 
 /// Compose the frame without the clock into `frame` (`w × h` premultiplied BGRA) and return the
-/// scene to re-render the clock from, plus the decoded image's accent (before depth / vignette).
+/// scene to re-render the clock from, plus the decoded image's Material You source colour (before depth / vignette).
 fn build_scene(
     wic: &IWICImagingFactory,
     w: usize,
@@ -1081,7 +1173,7 @@ fn build_scene(
     bg: Color,
     frame: &mut [u8],
     wide: bool,
-) -> (Scene, Option<Color>, Option<io::Error>) {
+) -> (Scene, Option<[u8; 3]>, Option<io::Error>) {
     let bgc = bgr(bg);
     let mut err = None;
     let decoded = match image {
@@ -1102,8 +1194,8 @@ fn build_scene(
             *p = fill;
         }
     }
-    let accent = if decoded {
-        accent_from(frame, w, h, true)
+    let seed = if decoded {
+        material::source_color(frame, w, h, true)
     } else {
         None
     };
@@ -1128,7 +1220,7 @@ fn build_scene(
             depth,
             small,
         },
-        accent,
+        seed,
         err,
     )
 }
@@ -1357,6 +1449,8 @@ pub enum Event {
     Applied {
         image: Option<PathBuf>,
         accent: Option<Color>,
+        /// Material You source colour of the image (the whole theme is generated from it).
+        seed: Option<[u8; 3]>,
         rotated: bool,
         at_ms: u64,
     },
@@ -1409,6 +1503,8 @@ enum Cmd {
     Rank(char),
     Blurred(bool),
     Rotate,
+    /// Rotation period in hours (0 = off).
+    Hours(f32),
     /// Display size changed, or the clock may be stale (resume, time change).
     Resize,
     Tick,
@@ -1511,7 +1607,7 @@ impl Engine {
                     self.rank = r;
                     work.clock = true;
                     // a rank switch shows that rank's wallpapers (when the current one is elsewhere)
-                    let dir = self.rot.root.as_ref().map(|root| rank_dir(root, r));
+                    let dir = self.rot.root.as_ref().map(|root| images_dir(root, r));
                     let inside = match (&dir, &self.image) {
                         (Some(d), Some(i)) => i.parent().map(|p| same_path(p, d)).unwrap_or(false),
                         _ => true,
@@ -1528,6 +1624,7 @@ impl Engine {
                     work.frost = true;
                 }
             }
+            Cmd::Hours(h) => self.rot.hours = h,
             Cmd::Rotate => {
                 if self.rotate(false) {
                     work.reload = true;
@@ -1576,8 +1673,8 @@ impl Engine {
         let Ok(mut dib) = Dib::new(w, h) else {
             return;
         };
-        let (err, accent) = loop {
-            let (scene, accent, err) = build_scene(
+        let (err, seed) = loop {
+            let (scene, seed, err) = build_scene(
                 &self.wic,
                 w,
                 h,
@@ -1587,13 +1684,15 @@ impl Engine {
                 self.wide_clock,
             );
             if err.is_none() && self.dynamic_accent {
-                if let Some(a) = accent {
-                    self.accent = a;
+                if let Some(s) = seed {
+                    self.accent = color_of(material::Scheme::dark(s).primary);
                 }
             }
+            // glass backdrop from the picture itself, before the clock is drawn into the frame
+            render::set_backdrop(Some(glass_of(dib.px(), w, h)));
             self.scene = Some(scene);
             if self.render_clock(Some(&mut dib)) {
-                break (err, accent);
+                break (err, seed);
             }
             // the text overflowed its rectangle (unexpected font metrics): use the full width
             self.wide_clock = true;
@@ -1604,12 +1703,18 @@ impl Engine {
                 image: p.clone(),
                 error: e.to_string(),
             }),
-            _ => self.emit(Event::Applied {
-                image: self.image.clone(),
-                accent,
-                rotated,
-                at_ms: unix_ms(),
-            }),
+            _ => {
+                if let Some(p) = &self.image {
+                    set_system_wallpaper(p);
+                }
+                self.emit(Event::Applied {
+                    image: self.image.clone(),
+                    accent: seed.map(|s| color_of(material::Scheme::dark(s).primary)),
+                    seed,
+                    rotated,
+                    at_ms: unix_ms(),
+                })
+            }
         }
         if let Ok(mut s) = self.shared.lock() {
             s.w = w;
@@ -2453,6 +2558,10 @@ impl Handle {
     /// Frosted + dimmed frame while a panel is open.
     pub fn set_blurred(&self, blurred: bool) {
         let _ = self.tx.send(Cmd::Blurred(blurred));
+    }
+    /// Rotation period in hours; 0 turns folder rotation off.
+    pub fn set_rotation(&self, hours: f32) {
+        let _ = self.tx.send(Cmd::Hours(hours));
     }
     /// Next image of the current rank folder now (also resets the rotation period).
     pub fn rotate_now(&self) {

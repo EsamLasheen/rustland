@@ -22,8 +22,8 @@ try {
     New-Item -ItemType Directory -Force $releaseDir | Out-Null
     Copy-Item -LiteralPath (Join-Path $targetRoot 'release\monarch-next.exe') -Destination (Join-Path $releaseDir 'MonarchNext.exe') -Force
     # the same executable installs itself when its file name contains "setup"
-    Move-Item -LiteralPath (Join-Path $releaseDir 'MonarchNext.exe') -Destination (Join-Path $releaseDir 'SoloLevelingShell-Setup.exe') -Force
-    $hash = Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $releaseDir 'SoloLevelingShell-Setup.exe')
-    "$($hash.Hash)  SoloLevelingShell-Setup.exe" | Set-Content (Join-Path $releaseDir 'SHA256SUMS.txt')
+    Move-Item -LiteralPath (Join-Path $releaseDir 'MonarchNext.exe') -Destination (Join-Path $releaseDir 'RustLand-Setup.exe') -Force
+    $hash = Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $releaseDir 'RustLand-Setup.exe')
+    "$($hash.Hash)  RustLand-Setup.exe" | Set-Content (Join-Path $releaseDir 'SHA256SUMS.txt')
     $hash | Format-Table
 } finally { Pop-Location }
