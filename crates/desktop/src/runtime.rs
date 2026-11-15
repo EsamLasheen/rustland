@@ -75,6 +75,21 @@ const WM_SHELL_REAPPBAR: u32 = WM_APP + 55;
 const T_CLIP: usize = 10;
 /// Title changes of the focused window are folded into one bar repaint per 200 ms.
 const T_TITLE: usize = 11;
+/// Next top-bar animation frame (only armed while an effect runs or is scheduled).
+const T_BAR_FX: usize = 12;
+const T_RASTO_WALK: usize = 40;
+const T_RASTO_ROAM: usize = 41;
+const T_BAR_PAINT: usize = 42;
+const T_RESERVE_CHECK: usize = 43;
+const T_RESUME: usize = 44;
+/// At most one remark about the machine in this many seconds.
+const RASTO_REMARK_S: u64 = 20 * 60;
+/// Capsule notice arrival effect frames (~0.7 s per notice).
+const T_NOTICE: usize = 13;
+const NOTICE_FX_MS: f32 = 700.;
+/// Panel press ripple frames.
+const T_RIPPLE: usize = 14;
+const RIPPLE_MS: f32 = 380.;
 static TITLE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const TME_LEAVE: TRACKMOUSEEVENT_FLAGS = TRACKMOUSEEVENT_FLAGS(2);
 
@@ -131,6 +146,13 @@ struct Shell {
     left: HWND,
     panel: HWND,
     tip: HWND,
+    rasto: HWND,
+    glass_pane: HWND,
+    trip: Option<crate::rasto::Trip>,
+    /// Clicks on Rasto in a row and when the last one was.
+    rasto_clicks: (u8, Option<Instant>),
+    /// When he last commented on the machine.
+    rasto_said: Instant,
     // models
     top: topbar::State,
     cap: capsule::State,
@@ -160,11 +182,18 @@ struct Shell {
     cap_anim: Option<Anim>,
     /// The app that had the keyboard before the capsule card opened (given back on close).
     cap_prev: HWND,
+    /// Top-bar micro-animations (battery, workspace slide, counters).
+    bar_fx: crate::fx::BarFx,
+    /// Bar, capsule and left bar are hidden for a fullscreen window in front.
+    fs_hidden: bool,
     cap_morph: f32,
     cap_island_w: f32,
     left_shown: bool,
     edge_near: bool,
     request_until: Option<Instant>,
+    /// When the current notice arrived (drives its arrival effect).
+    notice_at: Option<Instant>,
+    ripple_at: Option<Instant>,
     caret_on: bool,
     started: Instant,
 }
@@ -181,7 +210,15 @@ fn root() -> HWND {
 }
 
 fn scale(h: HWND) -> f32 {
-    unsafe { GetDpiForWindow(h).max(96) as f32 / 96. }
+    unsafe { GetDpiForWindow(h).max(96) as f32 / 96. * ui_scale() }
+}
+/// Size of the shell's surfaces relative to the system DPI (`uiScale` in shell.json).
+static UI_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+fn ui_scale() -> f32 {
+    match UI_SCALE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => 1.,
+        bits => f32::from_bits(bits),
+    }
 }
 fn screen() -> (i32, i32) {
     unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
@@ -190,6 +227,21 @@ fn screen() -> (i32, i32) {
 /// Theme for the settings: a Material You scheme from the wallpaper's source colour when dynamic
 /// colours are on, else the classic theme around the rank/preset accent.
 fn tokens_of(cfg: &config::ShellConfig) -> Tokens {
+    if !cfg.dynamic_accent {
+        if let Some(p) = &cfg.custom_palette {
+            let mut t = Tokens::new(Color::hex(&p.accent));
+            t.bg = Color::hex(&p.bg);
+            t.surface = Color::hex(&p.surface);
+            t.surface2 = t.surface;
+            t.surface_solid = t.surface;
+            t.surface_hover = t.surface.mix(t.accent, 0.9);
+            t.text = Color::hex(&p.text);
+            t.muted = Color::hex(&p.muted);
+            t.success = Color::hex(&p.success);
+            t.warning = Color::hex(&p.warning);
+            return t;
+        }
+    }
     match (
         cfg.dynamic_accent,
         monarch_core::material::parse_hex(&cfg.seed),
@@ -209,6 +261,12 @@ fn accent_of(cfg: &config::ShellConfig) -> Color {
 
 // ── painting ─────────────────────────────────────────────────────────────
 fn paint(role: Role) {
+    count_paint(match role {
+        Role::Bar => 0,
+        Role::Capsule => 1,
+        Role::Left => 2,
+        Role::Panel => 3,
+    });
     with(|s| unsafe {
         let h = match role {
             Role::Bar => s.bar,
@@ -382,16 +440,31 @@ fn refresh_metrics(s: &mut Shell) {
         return;
     };
     let snap = sample.snap;
+    let shown = [s.top.cpu, s.top.ram];
     s.top.cpu = snap.cpu.map(|v| v as f32);
     s.top.ram = snap.memory.map(|v| v as f32);
     s.top.battery = snap.battery.map(|p| (p as f32, snap.charging));
+    let now = Instant::now();
     if let Some((p, ch)) = s.top.battery {
         if let Some(r) = s.osd.battery(p, ch) {
             post_request(r);
         }
+        s.bar_fx.on_battery(now, p, ch);
+    }
+    if s.store.config.pet && s.rasto_said.elapsed().as_secs() >= RASTO_REMARK_S {
+        let hour = unsafe { windows::Win32::System::SystemInformation::GetLocalTime().wHour };
+        if let Some(line) = crate::rasto::remark(s.top.cpu, s.top.ram, s.top.battery, hour) {
+            s.rasto_said = Instant::now();
+            rasto_line(line);
+        }
     }
     s.pn.cpu = s.top.cpu;
     s.pn.ram = s.top.ram;
+    // counters roll to the new reading on mains power; on battery they just change
+    let mains = snap.battery.is_none() || snap.charging;
+    s.bar_fx
+        .on_metrics(now, shown, [s.top.cpu, s.top.ram], mains);
+    arm_bar_fx(s);
     s.pn.battery = snap.battery.map(|p| p as f32);
     s.pn.mem_text = format!("{:.1}G / {:.0}G", snap.used_gib, snap.total_gib);
     s.pn.threads = std::thread::available_parallelism()
@@ -706,6 +779,9 @@ fn apply_config(s: &mut Shell) {
         tokens_of(c)
     };
     render::set_glass(c.glass);
+    UI_SCALE.store(c.ui_scale_clamped().to_bits(), std::sync::atomic::Ordering::Relaxed);
+    s.top.pet = c.pet;
+    s.bar_fx.pet = c.pet;
     s.pn.rank = c.rank;
     s.pn.ranks = config::RANKS
         .iter()
@@ -716,13 +792,21 @@ fn apply_config(s: &mut Shell) {
     s.pn.dynamic_accent = c.dynamic_accent;
     s.pn.reduce_motion = c.reduce_motion;
     s.pn.glass = c.glass;
+    s.pn.window_glass = c.window_glass;
+    crate::winglass::configure(s.bar, c.window_glass, c.window_opacity, c.window_blur, c.window_glass_exclude.clone());
     s.pn.leftbar_autohide = c.leftbar_autohide;
     s.pn.focus_pulse = c.focus_pulse.clone();
     s.pn.rotate_enabled = c.rotate_enabled;
     s.pn.version = env!("CARGO_PKG_VERSION").into();
+    s.pn.config_notice = s.store.error.clone().unwrap_or_default();
     s.pn.presets = crate::presets::names();
 }
 
+/// A program is fullscreen in front. Not just "covers the monitor": so does the desktop itself when
+/// it has the focus, and treating that as fullscreen froze every animation in the bar.
+fn fullscreen_app(h: HWND) -> bool {
+    unsafe { !is_own(h) && crate::shell::is_app_window(h) && crate::wm::covers_monitor(h) }
+}
 fn is_own(h: HWND) -> bool {
     let mut pid = 0;
     unsafe {
@@ -745,6 +829,11 @@ pub fn request(r: capsule::Request) {
         let ms = r.timeout_ms;
         s.cap.request = Some(r);
         s.request_until = Some(Instant::now() + std::time::Duration::from_millis(ms as u64));
+        if !s.store.config.reduce_motion && !crate::glow::unseen() {
+            s.notice_at = Some(Instant::now());
+            s.cap.flash = Some(0.);
+            crate::pacer::start(s.capsule, T_NOTICE);
+        }
         unsafe {
             SetTimer(Some(s.capsule), T_REQUEST, ms, None);
         }
@@ -813,15 +902,22 @@ fn open_panel(tab: Tab) {
                     from: s.panel_slide,
                     to: 1.,
                 });
-                SetTimer(Some(s.panel), T_ANIM, 16, None);
+                crate::pacer::start(s.panel, T_ANIM);
             }
         }
     });
+    sync_surface_open();
     show_left(true);
     arm_caret();
     paint(Role::Panel);
     paint(Role::Left);
 }
+/// Tell focus-follows-mouse whether a panel or the capsule card is open (it waits meanwhile).
+fn sync_surface_open() {
+    let open = with(|s| s.lb.open.is_some() || s.cap.expanded).unwrap_or(false);
+    crate::wm_bridge::SURFACE_OPEN.store(open, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The caret blinks only while a text field has focus (no idle wake-ups otherwise).
 fn arm_caret() {
     with(|s| unsafe {
@@ -833,7 +929,7 @@ fn arm_caret() {
 }
 
 fn close_panel() {
-    with(|s| unsafe {
+    with(|s| {
         if s.pn.tab.is_none() {
             return;
         }
@@ -849,8 +945,9 @@ fn close_panel() {
             from: s.panel_slide,
             to: 0.,
         });
-        SetTimer(Some(s.panel), T_ANIM, 16, None);
+        crate::pacer::start(s.panel, T_ANIM);
     });
+    sync_surface_open();
     paint(Role::Left);
     let near = with(|s| s.edge_near).unwrap_or(false);
     if !near {
@@ -897,9 +994,8 @@ fn refresh_tab(s: &mut Shell, tab: Tab) {
             s.pn.muted = m;
             subsystems::send(C::RefreshRadios);
             subsystems::send(C::RefreshBrightness);
-            if s.pn.wallpapers.is_empty() && s.pn.banner.is_none() {
-                subsystems::load_wallpapers(s.bar, &s.store.config);
-            }
+            // Refresh the folder on every visit so newly added images appear without a restart.
+            subsystems::load_wallpapers(s.bar, &s.store.config);
         }
         Tab::Network => {
             subsystems::send(C::RefreshWifi);
@@ -1000,7 +1096,7 @@ pub fn dismiss_surfaces() {
 }
 
 fn open_capsule(tab: capsule::Tab) {
-    with(|s| unsafe {
+    with(|s| {
         let already = s.cap.expanded && s.cap.tab == Some(tab);
         if already {
             s.cap.expanded = false;
@@ -1019,7 +1115,7 @@ fn open_capsule(tab: capsule::Tab) {
             from: s.cap_morph,
             to,
         });
-        SetTimer(Some(s.capsule), T_ANIM, 16, None);
+        crate::pacer::start(s.capsule, T_ANIM);
     });
     resize_capsule();
     with(|s| unsafe {
@@ -1037,6 +1133,7 @@ fn open_capsule(tab: capsule::Tab) {
             }
         }
     });
+    sync_surface_open();
     paint(Role::Capsule);
 }
 
@@ -1072,6 +1169,204 @@ fn push(i: Inbound) {
 pub fn post_cmd(c: Cmd) {
     push(Inbound::Cmd(c));
 }
+fn rasto_line(text: &str) {
+    post_request(capsule::Request {
+        priority: 2,
+        timeout_ms: 2500,
+        icon: "cpu",
+        text: text.into(),
+        progress: None,
+        tone: capsule::Tone::Crit,
+    });
+}
+/// Rasto answers a click with one of his plans for the machine; keep clicking and he gets annoyed,
+/// then storms off along your windows.
+fn rasto_clicked() {
+    const LINES: [&str; 4] = [
+        "راستو: الويندوز ده بتاعي دلوقتي",
+        "راستو: هاكل الرام كلها... هاهاها",
+        "راستو: متلمسنيش، بخطط لحاجة",
+        "راستو: هقفل كل التابات بتاعتك",
+    ];
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = with(|s| {
+        let recent = s.rasto_clicks.1.is_some_and(|t| t.elapsed().as_secs() < 6);
+        let n = if recent { s.rasto_clicks.0 + 1 } else { 1 };
+        s.rasto_clicks = (n, Some(Instant::now()));
+        s.top.pet_angry = n >= 2;
+        n
+    })
+    .unwrap_or(1);
+    match n {
+        1 => {
+            let i = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % LINES.len();
+            rasto_line(LINES[i]);
+        }
+        2 => {
+            rasto_line("راستو: بطّل تدوس عليا!");
+            paint(Role::Bar);
+        }
+        _ => {
+            rasto_line("راستو: خلاص زهقت! ماشي من هنا");
+            start_rasto_walk();
+        }
+    }
+}
+/// Next walk on his own, a few minutes from now.
+fn arm_rasto_roam() {
+    with(|s| unsafe {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let minutes = 4 + nanos % 6;
+        SetTimer(Some(s.bar), T_RASTO_ROAM, minutes * 60_000, None);
+    });
+}
+/// His tour: the top edges of up to two windows on screen, front ones first, or the bottom of the
+/// screen when there are none. He stands on the edge, in front of the bar if it is that close.
+unsafe fn rasto_route(home: (f32, f32), side: f32, stand: f32, sw: f32, sh: f32) -> Vec<crate::rasto::Leg> {
+    use crate::rasto::{span, Leg};
+    unsafe extern "system" fn collect(h: HWND, l: LPARAM) -> windows::core::BOOL {
+        let v = &mut *(l.0 as *mut Vec<RECT>);
+        if v.len() < 2
+            && crate::shell::is_app_window(h)
+            && !is_own(h)
+            && !IsIconic(h).as_bool()
+            && !crate::wm::covers_monitor(h)
+        {
+            let mut r = RECT::default();
+            if GetWindowRect(h, &mut r).is_ok() && r.right - r.left > 200 {
+                v.push(r);
+            }
+        }
+        windows::core::BOOL(1)
+    }
+    let mut windows: Vec<RECT> = Vec::new();
+    let _ = EnumWindows(Some(collect), LPARAM(&mut windows as *mut Vec<RECT> as isize));
+    let mut legs = Vec::new();
+    let mut near = home.0;
+    for r in &windows {
+        let y = (r.top as f32 - stand).max(0.);
+        if let Some((a, b)) = span(r.left as f32, r.right as f32 - side, near, 20.) {
+            legs.extend([Leg::Jump(a, y), Leg::Idle(500.), Leg::Walk(b), Leg::Idle(1800.)]);
+            near = b;
+        }
+    }
+    if legs.is_empty() {
+        let (a, b) = span(0., sw - side, home.0, 40.).unwrap_or((40., 40.));
+        let y = sh - stand - 6.;
+        legs.extend([Leg::Jump(a, y), Leg::Walk(b), Leg::Idle(2200.)]);
+    }
+    legs.push(Leg::Jump(home.0, home.1));
+    legs
+}
+/// Off the bar and on his tour.
+fn start_rasto_walk() {
+    let started = with(|s| unsafe {
+        let fg = GetForegroundWindow();
+        if s.trip.is_some()
+            || !s.store.config.pet
+            || s.store.config.reduce_motion
+            || crate::glow::unseen()
+            || s.fs_hidden
+            || fullscreen_app(fg)
+        {
+            return false;
+        }
+        let k = scale(s.bar);
+        let Some(home) = s.hits_bar.iter().find(|(_, h)| *h == topbar::Hit::Pet).map(|(r, _)| r) else {
+            return false;
+        };
+        // his 32-DIP window holds him 5.5 DIP below its top, like his place in the bar
+        let side = 32. * k;
+        let home_px = ((home.x + home.w / 2.) * k - side / 2., home.y * k);
+        let (sw, sh) = screen();
+        // feet on the edge: the body ends about 24 DIP down his window
+        let legs = rasto_route(home_px, side, 24. * k, sw as f32, sh as f32);
+        s.trip = Some(crate::rasto::Trip {
+            start: Instant::now(),
+            home: home_px,
+            legs,
+        });
+        s.top.pet = false;
+        crate::pacer::start(s.bar, T_RASTO_WALK);
+        true
+    })
+    .unwrap_or(false);
+    if started {
+        rasto_walk_frame();
+        paint(Role::Bar);
+    }
+}
+fn rasto_walk_frame() {
+    // he moves about 90 px/s, so frames beyond ~70 per second would draw the same pixels at 144 Hz
+    thread_local! { static LAST: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) }; }
+    if LAST.with(|l| l.get()).is_some_and(|t| t.elapsed().as_millis() < 12) {
+        return;
+    }
+    LAST.with(|l| l.set(Some(Instant::now())));
+    let home = with(|s| unsafe {
+        let fg = GetForegroundWindow();
+        let frame = s.trip.as_ref().and_then(|t| t.frame(Instant::now()));
+        let interrupted = crate::glow::unseen() || fullscreen_app(fg);
+        let Some(f) = frame.filter(|_| !interrupted) else {
+            crate::pacer::stop(s.bar, T_RASTO_WALK);
+            let _ = ShowWindow(s.rasto, SW_HIDE);
+            s.trip = None;
+            s.top.pet = s.store.config.pet;
+            s.top.pet_angry = false;
+            s.rasto_clicks = (0, None);
+            return true;
+        };
+        let k = scale(s.bar);
+        let side = (32. * k).round() as i32;
+        let center = (f.x + side as f32 / 2., f.y + side as f32 / 2.);
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let cursor = (cursor.x as f32, cursor.y as f32);
+        // the pointer comes close: he jumps in place, wide-eyed, and stares at it
+        let scare = crate::rasto::scare(cursor, center, side as f32);
+        let scared = scare > 0.;
+        let jump = if scared {
+            (s.started.elapsed().as_secs_f32() * 14.).sin().abs() * 9. * k * scare
+        } else {
+            0.
+        };
+        let idle_gaze = (f.look, 0.);
+        let near = (cursor.0 - center.0).hypot(cursor.1 - center.1) < side as f32 * 8.;
+        let _ = SetWindowPos(
+            s.rasto,
+            Some(HWND_TOPMOST),
+            f.x as i32,
+            (f.y - jump) as i32,
+            side,
+            side,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        let t = s.tokens;
+        let mood = topbar::RastoMood {
+            blink: f.blink.filter(|_| !scared),
+            grin: f.jumping,
+            angry: s.top.pet_angry,
+            flip: !f.facing_right,
+            gaze: if near { crate::rasto::gaze(cursor, center) } else { idle_gaze },
+            step: f.step,
+            squash: f.squash,
+            wag: f.wag,
+            scared,
+            ..Default::default()
+        };
+        let _ = render::present(s.rasto, side, side, k, |c| {
+            topbar::paint_rasto(c, 16., 8., &t, mood);
+        });
+        count_paint(5);
+        false
+    })
+    .unwrap_or(false);
+    if home {
+        paint(Role::Bar);
+    }
+}
 fn post_request(r: capsule::Request) {
     push(Inbound::Request(r));
 }
@@ -1104,6 +1399,7 @@ fn on_panel_hit(hit: panel::Hit, x: f32) {
             arm_caret();
         }
         H::Preset(name) => {
+            with(|s| s.store.config.custom_palette = None);
             with(|s| {
                 s.store.config.preset = name.clone();
                 // a picked theme wins over the wallpaper colours
@@ -1123,6 +1419,22 @@ fn on_panel_hit(hit: panel::Hit, x: f32) {
             request_text("crown", &format!("Theme · {name}"), capsule::Tone::Primary);
         }
         H::Rank(r) => {
+            with(|s| s.store.config.custom_palette = None);
+            // Solo Leveling system message: climbing the ranks is a level up
+            let order = |c: char| config::RANKS.iter().position(|(x, _)| *x == c);
+            let before = with(|s| s.store.config.rank).unwrap_or(r);
+            if r != before {
+                let up = order(r) > order(before);
+                request_text(
+                    if up { "crown" } else { "down" },
+                    &if up {
+                        format!("LEVEL UP  ·  RANK {r}")
+                    } else {
+                        format!("RANK {r}")
+                    },
+                    capsule::Tone::Primary,
+                );
+            }
             with(|s| {
                 s.store.config.rank = r;
                 s.store.config.accent = config::rank_color(r).into();
@@ -1133,12 +1445,19 @@ fn on_panel_hit(hit: panel::Hit, x: f32) {
             repaint_all();
         }
         H::Setting(key) => {
+            if key == "advanced" {
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe).arg("--setup").spawn();
+                }
+                return;
+            }
             with(|s| {
                 let c = &mut s.store.config;
                 match key {
                     "dynamicAccent" => c.dynamic_accent = !c.dynamic_accent,
                     "reduceMotion" => c.reduce_motion = !c.reduce_motion,
                     "glass" => c.glass = !c.glass,
+                    "windowGlass" => c.window_glass = !c.window_glass,
                     "leftbarAutohide" => c.leftbar_autohide = !c.leftbar_autohide,
                     "rotateEnabled" => c.rotate_enabled = !c.rotate_enabled,
                     "focusPulse" => {
@@ -1327,13 +1646,15 @@ fn on_panel_hit(hit: panel::Hit, x: f32) {
         | H::AiTest
         | H::AiSend
         | H::AiCapture
+        | H::AiRemoveCapture
         | H::AiClear
         | H::AiTheme
         | H::AiDiagnose => {
             let hide = with(|s| subsystems::ai_hit(&hit, &mut s.pn)).unwrap_or(false);
             if let Some(accent) = subsystems::take_ai_accent() {
                 with(|s| {
-                    s.store.config.accent = accent;
+                    s.store.config.accent = accent.accent.clone();
+                    s.store.config.custom_palette = Some(accent);
                     s.store.config.preset = "Gemini".into();
                     s.store.config.dynamic_accent = false;
                     apply_config(s);
@@ -1626,12 +1947,38 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
         _ => None,
     };
     match msg {
+        crate::winglass::WM_GLASS_FROST => { set_glass_pane(w.0 != 0); LRESULT(0) }
+        crate::pacer::WM_PACED => {
+            if crate::pacer::ack(h, w.0) { proc(h, WM_TIMER, w, LPARAM(0)) } else { LRESULT(0) }
+        }
         WM_TIMER => {
             match w.0 {
                 T_CLOCK => { with(|s| { refresh_clock(s); if unsafe { windows::Win32::System::SystemInformation::GetLocalTime() }.wMinute % 10 == 0 { save_usage(s); }; if s.pn.tab == Some(Tab::Notifications) { sync_alerts(s); } }); arm_clock(h); resize_capsule(); paint(Role::Capsule); }
                 T_CARET => { let on_panel = with(|s| { s.caret_on = !s.caret_on; s.pn.focused_input.is_some() && s.pn.tab.is_some() && s.panel_slide > 0. }).unwrap_or(false); if on_panel { paint(Role::Panel); } else { let _ = KillTimer(Some(h), T_CARET); } }
                 T_CLIP => { let _ = KillTimer(Some(h), T_CLIP); capture_clipboard(h); }
-                T_TITLE => { let _ = KillTimer(Some(h), T_TITLE); TITLE_ARMED.store(false, std::sync::atomic::Ordering::Relaxed); if with(refresh_window).unwrap_or(false) { paint(Role::Bar); } }
+                T_BAR_FX => { with(arm_bar_fx); paint(Role::Bar); }
+                T_BAR_PAINT => { let _ = KillTimer(Some(h), T_BAR_PAINT); BAR_DIRTY.with(|d| d.set(false)); paint(Role::Bar); }
+                T_RESUME => { let _ = KillTimer(Some(h), T_RESUME); on_resume(); }
+                T_RESERVE_CHECK => { let _ = KillTimer(Some(h), T_RESERVE_CHECK); ensure_reserved(); }
+                T_RASTO_WALK => rasto_walk_frame(),
+                T_RASTO_ROAM => { start_rasto_walk(); arm_rasto_roam(); }
+                T_RIPPLE => {
+                    with(|s| {
+                        let p = s.ripple_at.map_or(1., |t| t.elapsed().as_secs_f32() * 1000. / RIPPLE_MS);
+                        if p >= 1. { s.pn.ripple = None; s.ripple_at = None; crate::pacer::stop(h, T_RIPPLE); }
+                        else if let Some(rp) = s.pn.ripple.as_mut() { rp.3 = p; }
+                    });
+                    paint(Role::Panel);
+                }
+                T_NOTICE => {
+                    with(|s| {
+                        let p = s.notice_at.map_or(1., |t| t.elapsed().as_secs_f32() * 1000. / NOTICE_FX_MS);
+                        s.cap.flash = (p < 1.).then_some(p);
+                        if p >= 1. { s.notice_at = None; crate::pacer::stop(h, T_NOTICE); }
+                    });
+                    paint(Role::Capsule);
+                }
+                T_TITLE => { let _ = KillTimer(Some(h), T_TITLE); TITLE_ARMED.store(false, std::sync::atomic::Ordering::Relaxed); if with(refresh_window).unwrap_or(false) { invalidate_bar(); } }
                 T_FOCUS => {
                     if !with(apply_focus).unwrap_or(false) { let _ = KillTimer(Some(h), T_FOCUS); }
                     paint(Role::Capsule);
@@ -1654,7 +2001,7 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                         Some(Role::Panel) => {
                             let done = with(|s| { if let Some(a) = &s.panel_anim { let (v, d) = a.value(ease_cubic); s.panel_slide = v; if d { s.panel_anim = None; } d } else { true } }).unwrap_or(true);
                             if done {
-                                let _ = KillTimer(Some(h), T_ANIM);
+                                crate::pacer::stop(h, T_ANIM);
                                 let closed = with(|s| s.panel_slide <= 0.001).unwrap_or(false);
                                 if closed { with(|s| s.pn.tab = None); let _ = ShowWindow(h, SW_HIDE); }
                             }
@@ -1662,10 +2009,10 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                         }
                         Some(Role::Capsule) => {
                             let done = with(|s| { if let Some(a) = &s.cap_anim { let (v, d) = a.value(ease_back); let to = a.to; s.cap_morph = v.max(0.); if d { s.cap_anim = None; s.cap_morph = to; } d } else { true } }).unwrap_or(true);
-                            if done { let _ = KillTimer(Some(h), T_ANIM); resize_capsule(); }
+                            if done { crate::pacer::stop(h, T_ANIM); resize_capsule(); }
                             paint(Role::Capsule);
                         }
-                        _ => { let _ = KillTimer(Some(h), T_ANIM); }
+                        _ => { crate::pacer::stop(h, T_ANIM); }
                     }
                 }
                 _ => {}
@@ -1714,6 +2061,7 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                     match hit {
                         Some(topbar::Hit::Network) => open_panel(Tab::Network),
                         Some(topbar::Hit::Monitor) => open_panel(Tab::Monitoring),
+                        Some(topbar::Hit::Pet) => { with(|s| { s.bar_fx.on_pet(Instant::now()); arm_bar_fx(s); }); paint(Role::Bar); rasto_clicked(); }
                         Some(topbar::Hit::Workspace(i)) => crate::wm_bridge::action(&format!("focus-workspace {i}")),
                         Some(topbar::Hit::TrayMore) => { with(|s| s.top.tray_expanded = !s.top.tray_expanded); paint(Role::Bar); }
                         Some(topbar::Hit::Tray(id)) => subsystems::tray_click(&id, false),
@@ -1721,7 +2069,13 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                     }
                 }
                 Some(Role::Left) => { let hit = with(|s| s.hits_left.iter().find(|(r, _)| r.contains(x, y)).map(|(_, t)| *t)).flatten(); if let Some(t) = hit { toggle_panel(t); } }
-                Some(Role::Panel) => { let hit = with(|s| s.hits_panel.iter().find(|(r, _)| r.contains(x, y)).map(|(_, hh)| hh.clone())).flatten(); if let Some(hh) = hit { on_panel_hit(hh, x); } }
+                Some(Role::Panel) => {
+                    let found = with(|s| s.hits_panel.iter().find(|(r, _)| r.contains(x, y)).cloned()).flatten();
+                    if let Some((r, hh)) = found {
+                        start_ripple(r, x, y);
+                        on_panel_hit(hh, x);
+                    }
+                }
                 Some(Role::Capsule) => {
                     let hit = with(|s| s.hits_cap.iter().find(|(r, _)| r.contains(x, y)).map(|(_, hh)| hh.clone())).flatten();
                     match hit {
@@ -1793,6 +2147,7 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
         // Alt+Tab / Win key away from an open panel or card closes it (mouse clicks are the hook's)
         WM_ACTIVATE if (role == Some(Role::Panel) || role == Some(Role::Capsule)) && (w.0 & 0xFFFF) as u32 == WA_INACTIVE => {
             let to = HWND(l.0 as *mut _);
+            if debug_enabled() { if let Ok(p) = crate::platform::paths() { crate::platform::log(&p, &format!("deactivate -> {:?} {}", to.0, crate::shell::window_title(to))); } }
             if !to.is_invalid() && !is_own(to) { post_cmd(Cmd::Dismiss); }
             DefWindowProcW(h, msg, w, l)
         }
@@ -1864,7 +2219,7 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
             LRESULT(0)
         }
         subsystems::WM_THUMBS => {
-            with(|s| { let cur = s.store.config.wallpaper.clone(); let (list, banner) = subsystems::take_thumbs(l, &cur); s.pn.wallpapers = list; s.pn.banner = banner; });
+            with(|s| { let cur = s.store.config.wallpaper.clone(); if let Some((list, banner)) = subsystems::take_thumbs(l, &cur) { s.pn.wallpapers = list; s.pn.banner = banner; } });
             if with(|s| s.pn.tab.is_some()).unwrap_or(false) { paint(Role::Panel); }
             LRESULT(0)
         }
@@ -1873,8 +2228,8 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
             if reopen { open_panel(Tab::Ai); } else if with(|s| s.pn.tab == Some(Tab::Ai)).unwrap_or(false) { paint(Role::Panel); }
             LRESULT(0)
         }
-        subsystems::WM_TRAY => { with(|s| s.top.tray = subsystems::tray_icons()); paint(Role::Bar); LRESULT(0) }
-        WM_METRICS => { with(refresh_metrics); if with(|s| s.pn.tab == Some(Tab::Monitoring) && s.panel_slide > 0.).unwrap_or(false) { subsystems::send(sysctl::Command::SampleProcesses); } paint(Role::Bar); if with(|s| s.pn.tab == Some(Tab::Monitoring) || s.pn.tab == Some(Tab::Network)).unwrap_or(false) { paint(Role::Panel); }; LRESULT(0) }
+        subsystems::WM_TRAY => { with(|s| s.top.tray = subsystems::tray_icons()); invalidate_bar(); LRESULT(0) }
+        WM_METRICS => { ensure_reserved(); health_tick(); hooks_watch(); with(refresh_metrics); if with(|s| s.pn.tab == Some(Tab::Monitoring) && s.panel_slide > 0.).unwrap_or(false) { subsystems::send(sysctl::Command::SampleProcesses); } paint(Role::Bar); if with(|s| s.pn.tab == Some(Tab::Monitoring) || s.pn.tab == Some(Tab::Network)).unwrap_or(false) { paint(Role::Panel); }; LRESULT(0) }
         subsystems::WM_AUDIO_DEVICE => {
             subsystems::audio_device_changed();
             let (v, m) = subsystems::audio_state();
@@ -1914,8 +2269,8 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
             paint(Role::Capsule);
             LRESULT(0)
         }
-        WM_SHELL_FG => { if with(refresh_window).unwrap_or(false) { paint(Role::Bar); } LRESULT(0) }
-        crate::wm::WM_STATE_CHANGED => { with(|s| { refresh_workspaces(s); refresh_window(s); }); paint(Role::Bar); LRESULT(0) }
+        WM_SHELL_FG => { with(sync_fullscreen); if with(refresh_window).unwrap_or(false) { invalidate_bar(); } LRESULT(0) }
+        crate::wm::WM_STATE_CHANGED => { with(|s| { sync_fullscreen(s); refresh_workspaces(s); refresh_window(s); }); invalidate_bar(); LRESULT(0) }
         WM_SHELL_EDGE => {
             let near = w.0 != 0;
             with(|s| s.edge_near = near);
@@ -1939,10 +2294,15 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
         WM_APPBAR => { if w.0 as u32 == ABN_POSCHANGED { place_bar(); } LRESULT(0) }
         WM_DISPLAYCHANGE | WM_DPICHANGED if role == Some(Role::Bar) => { let _ = PostMessageW(Some(h), WM_SHELL_RELAYOUT, WPARAM(0), LPARAM(0)); LRESULT(0) }
         WM_SHELL_REAPPBAR => { register_appbar(); LEFT_APPBAR.with(|c| c.set(false)); place_bar(); LRESULT(0) }
-        WM_SHELL_RELAYOUT => { place_bar(); resize_capsule(); repaint_all(); LRESULT(0) }
+        WM_SHELL_RELAYOUT => { place_bar(); resize_capsule(); repaint_all(); refresh_glass_pane(); LRESULT(0) }
         WM_CLOSE if role != Some(Role::Bar) => { dismiss_surfaces(); LRESULT(0) }
+        // PBT_APMRESUMESUSPEND / PBT_APMRESUMEAUTOMATIC (both may arrive: one refresh, a moment later)
+        WM_POWERBROADCAST if role == Some(Role::Bar) => {
+            if w.0 == 0x7 || w.0 == 0x12 { SetTimer(Some(h), T_RESUME, 1500, None); }
+            LRESULT(1)
+        }
         WM_QUERYENDSESSION => LRESULT(1),
-        WM_ENDSESSION if role == Some(Role::Bar) && w.0 != 0 => { with(save_usage); crate::taskbar::restore(); LRESULT(0) }
+        WM_ENDSESSION if role == Some(Role::Bar) && w.0 != 0 => { with(save_usage); crate::winglass::stop(); crate::taskbar::restore(); LRESULT(0) }
         WM_DESTROY if role == Some(Role::Bar) => { PostQuitMessage(0); LRESULT(0) }
         _ => {
             let tc = TASKBAR_CREATED.load(std::sync::atomic::Ordering::Relaxed);
@@ -1973,6 +2333,52 @@ fn appbar_data(h: HWND) -> APPBARDATA {
         ..Default::default()
     }
 }
+/// Explorer can lose the bar's reservation (shell restarted, a previous instance still leaving):
+/// windows would then slide under the bar until the next sign-in. Checked with every metrics tick.
+fn ensure_reserved() {
+    let lost = with(|s| unsafe {
+        if s.fs_hidden {
+            return false;
+        }
+        let mut work = RECT::default();
+        let got = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut work as *mut RECT as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        got.is_ok() && work.top < (crate::theme::BAR_H * scale(s.bar)).round() as i32
+    })
+    .unwrap_or(false);
+    thread_local! { static TRIES: std::cell::Cell<(u32, Option<Instant>)> = const { std::cell::Cell::new((0, None)) }; }
+    if !lost {
+        TRIES.with(|t| t.set((0, None)));
+        return;
+    }
+    // three quick tries, then one every 30 s: never a new process with every tick while Explorer is away
+    let (tries, last) = TRIES.with(|t| t.get());
+    if tries >= 3 && last.is_some_and(|t| t.elapsed().as_secs() < 30) {
+        return;
+    }
+    TRIES.with(|t| t.set((tries + 1, Some(Instant::now()))));
+    {
+        if tries == 0 || tries.is_multiple_of(20) {
+            if let Ok(p) = crate::platform::paths() { crate::platform::log(&p, &format!("appbar: reservation lost, asking again from a helper (try {})", tries + 1)); }
+        }
+        // measured: while the reservation is lost Explorer accepts ABM_SETPOS from this process
+        // (returns 1, rect correct) without changing the work area; the same call from any other
+        // process restores it at once. The cause is not known, so a short-lived copy of us asks.
+        let args = with(|s| {
+            let (sw, _) = screen();
+            (s.bar.0 as isize, sw, (crate::theme::BAR_H * scale(s.bar)).round() as i32)
+        });
+        if let (Some((h, w, ht)), Ok(exe)) = (args, std::env::current_exe()) {
+            let _ = std::process::Command::new(exe)
+                .args(["--appbar".to_string(), h.to_string(), w.to_string(), ht.to_string()])
+                .spawn();
+        }
+    }
+}
 fn register_appbar() {
     with(|s| unsafe {
         let mut d = appbar_data(s.bar);
@@ -1981,32 +2387,58 @@ fn register_appbar() {
         SHAppBarMessage(ABM_NEW, &mut d);
     });
 }
+/// Ask Explorer for the bar's strip. Runs on its own thread: the call goes through our tray host.
+fn reserve_bar(bar: HWND, sw: i32, bh: i32) {
+    let key = bar.0 as isize;
+    let _ = std::thread::Builder::new()
+        .name("appbar".into())
+        .spawn(move || unsafe { reserve(HWND(key as *mut _), sw, bh) });
+}
+unsafe fn reserve(bar: HWND, sw: i32, bh: i32) {
+    let mut d = appbar_data(bar);
+    SHAppBarMessage(ABM_NEW, &mut d); // no-op for a bar Explorer still knows
+    d.uEdge = ABE_TOP;
+    d.rc = RECT {
+        left: 0,
+        top: 0,
+        right: sw,
+        bottom: bh,
+    };
+    SHAppBarMessage(ABM_QUERYPOS, &mut d);
+    d.rc.bottom = d.rc.top + bh;
+    SHAppBarMessage(ABM_SETPOS, &mut d);
+}
+/// `--appbar <hwnd> <width> <height>`: see [`ensure_reserved`].
+pub fn appbar_helper(
+    h: Option<&String>,
+    w: Option<&String>,
+    ht: Option<&String>,
+) -> std::io::Result<()> {
+    let parse = |v: Option<&String>| {
+        v.and_then(|x| x.parse::<isize>().ok())
+            .ok_or_else(|| std::io::Error::other("--appbar <hwnd> <width> <height>"))
+    };
+    let (h, w, ht) = (parse(h)?, parse(w)?, parse(ht)?);
+    unsafe { reserve(HWND(h as *mut _), w as i32, ht as i32) };
+    Ok(())
+}
 fn place_bar() {
     with(|s| unsafe {
         let k = scale(s.bar);
         let (sw, sh) = screen();
         let bh = (crate::theme::BAR_H * k).round() as i32;
-        let mut d = appbar_data(s.bar);
-        d.uEdge = ABE_TOP;
-        d.rc = RECT {
-            left: 0,
-            top: 0,
-            right: sw,
-            bottom: bh,
-        };
-        SHAppBarMessage(ABM_QUERYPOS, &mut d);
-        d.rc.bottom = d.rc.top + bh;
-        SHAppBarMessage(ABM_SETPOS, &mut d);
+        reserve_bar(s.bar, sw, bh);
         let _ = SetWindowPos(
             s.bar,
             Some(HWND_TOPMOST),
-            d.rc.left,
-            d.rc.top,
+            0,
+            0,
             sw,
             bh,
             SWP_NOACTIVATE,
         );
         let lw = (leftbar::WIDTH * k).round() as i32;
+        crate::input_hooks::set_edges(bh, lw + (12. * k).round() as i32);
         let _ = SetWindowPos(
             s.left,
             Some(HWND_TOPMOST),
@@ -2091,7 +2523,87 @@ pub fn paste_text() -> Option<String> {
 }
 
 fn refresh_workspaces(s: &mut Shell) {
+    let before = s.top.workspaces.iter().position(|w| w.focused);
     s.top.workspaces = crate::wm_bridge::workspaces();
+    let after = s.top.workspaces.iter().position(|w| w.focused);
+    if let (Some(from), Some(to)) = (before, after) {
+        if from != to {
+            s.bar_fx.on_workspace(Instant::now(), from);
+            arm_bar_fx(s);
+        }
+    }
+}
+
+/// A fullscreen window in front (Win+M, F11, video, games) gets the whole screen: the bar,
+/// capsule and left bar step aside until it leaves fullscreen or another window comes forward.
+fn sync_fullscreen(s: &mut Shell) {
+    let full = unsafe {
+        let fg = GetForegroundWindow();
+        !is_own(fg) && crate::shell::is_app_window(fg) && crate::wm::covers_monitor(fg)
+    };
+    if full == s.fs_hidden {
+        return;
+    }
+    s.fs_hidden = full;
+    unsafe {
+        let cmd = if full { SW_HIDE } else { SW_SHOWNOACTIVATE };
+        let _ = ShowWindow(s.bar, cmd);
+        let _ = ShowWindow(s.capsule, cmd);
+        if full {
+            let _ = ShowWindow(s.left, SW_HIDE);
+            let _ = ShowWindow(s.tip, SW_HIDE);
+            s.left_shown = false;
+        } else if !s.store.config.leftbar_autohide {
+            let _ = ShowWindow(s.left, SW_SHOWNOACTIVATE);
+            s.left_shown = true;
+        }
+    }
+}
+
+/// Press feedback in the panel (skipped with reduced motion or nobody watching).
+fn start_ripple(r: Rect, x: f32, y: f32) {
+    with(|s| {
+        if s.store.config.reduce_motion || crate::glow::unseen() {
+            return;
+        }
+        s.pn.ripple = Some((r, x, y, 0.));
+        s.ripple_at = Some(Instant::now());
+        crate::pacer::start(s.panel, T_RIPPLE);
+    });
+}
+
+/// Apply the bar's animation state for now and arm the timer for its next frame. Nothing runs
+/// while the screen is unseen, a fullscreen app is in front, or motion is reduced.
+fn arm_bar_fx(s: &mut Shell) {
+    let quiet = s.store.config.reduce_motion
+        || crate::glow::unseen()
+        || unsafe {
+            fullscreen_app(GetForegroundWindow())
+        };
+    let next = s.bar_fx.frame(Instant::now(), &mut s.top, quiet);
+    let bar = s.bar;
+    unsafe {
+        match next {
+            // something moves: one frame per display refresh
+            Some(ms) if ms <= crate::fx::FRAME => {
+                let _ = KillTimer(Some(bar), T_BAR_FX);
+                crate::pacer::start(bar, T_BAR_FX);
+            }
+            Some(ms) => {
+                crate::pacer::stop(bar, T_BAR_FX);
+                SetTimer(Some(bar), T_BAR_FX, ms.min(60_000) as u32, None);
+            }
+            // quiet with an effect pending (e.g. still charging): look again in a while
+            None if quiet => {
+                crate::pacer::stop(bar, T_BAR_FX);
+                SetTimer(Some(bar), T_BAR_FX, 5_000, None);
+            }
+            None => {
+                crate::pacer::stop(bar, T_BAR_FX);
+                let _ = KillTimer(Some(bar), T_BAR_FX);
+            }
+        }
+    }
 }
 
 /// Self-measurement for validation runs (MONARCH_TEST_SECONDS): CPU time and private memory.
@@ -2145,7 +2657,7 @@ pub fn run() -> std::io::Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         // only the UI thread owns the desktop changes; a worker panic is logged and that worker stops
         if std::thread::current().name() == Some("main") {
-            crate::taskbar::restore();
+            crate::winglass::stop(); crate::taskbar::restore();
         }
         if let Ok(p) = crate::platform::paths() {
             crate::platform::log(&p, &format!("panic: {info}"));
@@ -2202,6 +2714,40 @@ pub fn run() -> std::io::Result<()> {
             SetWindowLongPtrW(h, GWLP_USERDATA, role);
             Ok(h)
         };
+        // On battery Windows throttles processes that own no foreground window (EcoQoS): for a shell
+        // that means late focus changes and animation frames. Opt out; the shell is idle almost
+        // always, so running at full speed for the moments it works costs no charge worth counting.
+        {
+            use windows::Win32::System::Threading::*;
+            let state = PROCESS_POWER_THROTTLING_STATE {
+                Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                StateMask: 0,
+            };
+            let _ = SetProcessInformation(
+                GetCurrentProcess(),
+                ProcessPowerThrottling,
+                &state as *const _ as *const _,
+                std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+            );
+        }
+        // Keep the shell's own pages in memory. When RAM is short Windows trims idle processes
+        // first, and a hook callback that has to page its code back in from disk is late: that key
+        // goes to Windows instead of the shell, and a hook that is late too often is removed.
+        {
+            use windows::Win32::System::Memory::*;
+            let _ = SetProcessWorkingSetSizeEx(
+                windows::Win32::System::Threading::GetCurrentProcess(),
+                24 << 20,
+                512 << 20,
+                QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE,
+            );
+        }
+        // frames and clicks stay responsive while other programs load the CPU
+        let _ = windows::Win32::System::Threading::SetThreadPriority(
+            windows::Win32::System::Threading::GetCurrentThread(),
+            windows::Win32::System::Threading::THREAD_PRIORITY_ABOVE_NORMAL,
+        );
         let bar = mk(w!("Monarch Next · bar"), WS_EX_NOACTIVATE, 1)?;
         let capsule = mk(w!("Monarch Next · capsule"), WINDOW_EX_STYLE(0), 2)?;
         let left = mk(w!("Monarch Next · left bar"), WS_EX_NOACTIVATE, 3)?;
@@ -2212,6 +2758,10 @@ pub fn run() -> std::io::Result<()> {
             5,
         )?;
         ROOT.store(bar.0 as isize, std::sync::atomic::Ordering::Relaxed);
+        let rasto = mk(w!("Monarch Next · rasto"), WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, 6)?;
+        let glass_pane = mk(w!("Monarch Next · glass"), WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, 7)?;
+        // the bottom of the z-order, not the top like the other surfaces
+        let _ = SetWindowPos(glass_pane, Some(HWND_NOTOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         let mut sh = Shell {
             tokens: Tokens::new(accent_of(&store.config)),
             store,
@@ -2224,6 +2774,11 @@ pub fn run() -> std::io::Result<()> {
             lb: leftbar::State::default(),
             pn: panel::State::default(),
             tip,
+            rasto,
+            glass_pane,
+            trip: None,
+            rasto_clicks: (0, None),
+            rasto_said: Instant::now(),
             tasks,
             tasks_path,
             clipboard: Clipboard::default(),
@@ -2246,11 +2801,15 @@ pub fn run() -> std::io::Result<()> {
             panel_slide: 0.,
             cap_anim: None,
             cap_prev: HWND::default(),
+            bar_fx: Default::default(),
+            fs_hidden: false,
             cap_morph: 0.,
             cap_island_w: 312.,
             left_shown: false,
             edge_near: false,
             request_until: None,
+            notice_at: None,
+            ripple_at: None,
             caret_on: true,
             started: Instant::now(),
         };
@@ -2281,6 +2840,9 @@ pub fn run() -> std::io::Result<()> {
         paint(Role::Bar);
         let _ = AddClipboardFormatListener(bar);
         arm_clock(capsule);
+        arm_rasto_roam();
+        // the reservation can be lost right at startup: look once early, then with every metrics tick
+        SetTimer(Some(bar), T_RESERVE_CHECK, 700, None);
         let hooks = [
             SetWinEventHook(
                 EVENT_SYSTEM_FOREGROUND,
@@ -2354,7 +2916,7 @@ pub fn run() -> std::io::Result<()> {
         }
         // orderly exit: give the screen space back, restore managed windows
         with(save_usage);
-        crate::taskbar::restore();
+        crate::winglass::stop(); crate::taskbar::restore();
         subsystems::stop();
         crate::wm_bridge::stop();
         crate::input_hooks::stop();
@@ -2375,4 +2937,243 @@ pub fn run() -> std::io::Result<()> {
         render::shutdown();
         Ok(())
     }
+}
+
+/// The pane should show; it may have to wait for the wallpaper to be decoded at startup.
+static GLASS_PANE_WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Blurred wallpaper under every window while glass windows are on screen (see `winglass.rs`).
+fn set_glass_pane(on: bool) {
+    GLASS_PANE_WANTED.store(on, std::sync::atomic::Ordering::Relaxed);
+    with(|s| unsafe {
+        let h = s.glass_pane;
+        let art = if on { render::backdrop_rgba() } else { None };
+        let Some((px, bw, bh)) = art else {
+            let _ = ShowWindow(h, SW_HIDE);
+            return;
+        };
+        let (sw, sh) = screen();
+        let _ = SetWindowPos(h, Some(HWND_BOTTOM), 0, 0, sw, sh, SWP_NOACTIVATE);
+        let _ = render::present(h, sw, sh, 1., |c| {
+            let r = Rect::new(0., 0., sw as f32, sh as f32);
+            c.image(&px, bw, bh, r, 1.);
+            c.fill_rect(r, Color::rgba(0, 0, 0, 0.28));
+        });
+        render::release_surface(h);
+        count_paint(4);
+        let _ = ShowWindow(h, SW_SHOWNA);
+        let _ = SetWindowPos(h, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    });
+}
+/// The wallpaper changed: the pane shows the new one.
+pub fn refresh_glass_pane() {
+    if GLASS_PANE_WANTED.load(std::sync::atomic::Ordering::Relaxed) {
+        set_glass_pane(true);
+    }
+}
+
+// ── self-observation ─────────────────────────────────────────────────────────────────────────
+
+thread_local! { static BAR_DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+/// Data-driven bar updates (tray icons, window title, workspaces, focus) are coalesced: a burst of
+/// events from a noisy program costs one paint, at most ~30 a second. Animations and clicks paint
+/// directly.
+fn invalidate_bar() {
+    if !BAR_DIRTY.with(|d| d.replace(true)) {
+        unsafe {
+            SetTimer(Some(root()), T_BAR_PAINT, 30, None);
+        }
+    }
+}
+
+const PAINT_NAMES: [&str; 6] = ["bar", "capsule", "left", "panel", "pane", "rasto"];
+/// A minute above this share of one core is written to the log with what was painted meanwhile.
+const BUSY_PCT: f64 = 4.;
+
+#[derive(Default)]
+struct Health {
+    ticks: u32,
+    minute: [u32; 6],
+    hour: [u32; 6],
+    cpu_minute: f64,
+    cpu_hour: f64,
+    at_minute: Option<Instant>,
+    at_hour: Option<Instant>,
+    last_busy: Option<Instant>,
+}
+thread_local! { static HEALTH: RefCell<Health> = RefCell::new(Health::default()); }
+
+fn count_paint(i: usize) {
+    HEALTH.with(|h| {
+        if let Ok(mut h) = h.try_borrow_mut() {
+            h.minute[i] = h.minute[i].saturating_add(1);
+            h.hour[i] = h.hour[i].saturating_add(1);
+        }
+    });
+}
+
+/// CPU seconds used by this process so far, and its private memory in MiB.
+fn own_usage() -> (f64, f64) {
+    use windows::Win32::System::{ProcessStatus::*, Threading::*};
+    unsafe {
+        let p = GetCurrentProcess();
+        let (mut c, mut e, mut k, mut u) = Default::default();
+        let _ = GetProcessTimes(p, &mut c, &mut e, &mut k, &mut u);
+        let ft =
+            |t: FILETIME| (((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64) as f64 / 1e7;
+        let mut m = PROCESS_MEMORY_COUNTERS_EX::default();
+        let _ = GetProcessMemoryInfo(
+            p,
+            &mut m as *mut _ as *mut PROCESS_MEMORY_COUNTERS,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        );
+        (ft(k) + ft(u), m.PrivateUsage as f64 / 1048576.)
+    }
+}
+
+/// Called with every metrics sample (3 s). Once a minute: was the shell itself busy? Once an hour:
+/// one line with its average CPU, memory and paint counts, so a slow leak or a repaint storm can be
+/// read from session.log afterwards instead of guessed.
+fn health_tick() {
+    let line = HEALTH.with(|h| {
+        let mut h = h.borrow_mut();
+        h.ticks = h.ticks.wrapping_add(1);
+        if !h.ticks.is_multiple_of(20) {
+            return None;
+        }
+        let (cpu, private) = own_usage();
+        let now = Instant::now();
+        let counts = |c: &[u32; 6]| {
+            PAINT_NAMES
+                .iter()
+                .zip(c)
+                .map(|(n, v)| format!("{n}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut out = None;
+        if let Some(at) = h.at_minute {
+            let secs = now.duration_since(at).as_secs_f64();
+            // a sample that spans a sleep says nothing
+            if (30.0..150.0).contains(&secs) {
+                let pct = (cpu - h.cpu_minute) / secs * 100.;
+                if pct >= BUSY_PCT && h.last_busy.is_none_or(|t| t.elapsed().as_secs() >= 600) {
+                    h.last_busy = Some(now);
+                    out = Some(format!(
+                        "busy: {pct:.1}% of a core for {secs:.0} s · paints {} · private {private:.0} MiB",
+                        counts(&h.minute)
+                    ));
+                }
+            }
+        }
+        h.at_minute = Some(now);
+        h.cpu_minute = cpu;
+        h.minute = [0; 6];
+        match h.at_hour {
+            // after the first minute (a baseline right after start), then hourly
+            Some(at) if h.ticks == 40 || h.ticks.is_multiple_of(1200) => {
+                let secs = now.duration_since(at).as_secs_f64();
+                if out.is_none() && secs < 2. * 3600. {
+                    out = Some(format!(
+                        "health: {:.2}% of a core over {:.0} min · paints {} · private {private:.0} MiB",
+                        (cpu - h.cpu_hour) / secs * 100.,
+                        secs / 60.,
+                        counts(&h.hour)
+                    ));
+                }
+                h.at_hour = Some(now);
+                h.cpu_hour = cpu;
+                h.hour = [0; 6];
+            }
+            None => {
+                h.at_hour = Some(now);
+                h.cpu_hour = cpu;
+                h.hour = [0; 6];
+            }
+            _ => {}
+        }
+        out
+    });
+    if let (Some(line), Ok(p)) = (line, crate::platform::paths()) {
+        crate::platform::log(&p, &line);
+    }
+}
+
+// ── sleep and hibernate ──────────────────────────────────────────────────────────────────────
+
+fn note(line: &str) {
+    if let Ok(p) = crate::platform::paths() {
+        crate::platform::log(&p, line);
+    }
+}
+
+/// Back from sleep or hibernate: Windows may have dropped the input hooks and the bar's
+/// reservation, and events were missed while everything was frozen. Put it all back in one go.
+fn on_resume() {
+    note("resume: reinstalling hooks, reservation and surfaces");
+    crate::input_hooks::restart();
+    place_bar();
+    resize_capsule();
+    repaint_all();
+    refresh_glass_pane();
+    crate::winglass::rescan();
+    unsafe {
+        SetTimer(Some(root()), T_RESERVE_CHECK, 700, None);
+    }
+}
+
+/// With every metrics sample: are the input hooks still alive? Dead hooks see nothing while the
+/// system keeps getting input, sample after sample. One event they missed proves nothing (some
+/// devices never pass through hooks), and neither does typing into an elevated window, which looks
+/// the same for as long as it lasts: a reinstall that did not help doubles the wait for the next.
+fn hooks_watch() {
+    #[derive(Clone, Copy)]
+    struct Watch {
+        event: u32,
+        input: u32,
+        streak: u32,
+        last: Option<Instant>,
+        wait: u64,
+        /// Not yet reported: hooks found removed (keyboard, mouse) and the slowest callback (ms).
+        lost: (u32, u32),
+        slow_ms: u32,
+        noted: Option<Instant>,
+    }
+    thread_local! { static WATCH: std::cell::Cell<Watch> = const { std::cell::Cell::new(Watch { event: 0, input: 0, streak: 0, last: None, wait: 60, lost: (0, 0), slow_ms: 0, noted: None }) }; }
+    let Some((event, input)) = crate::input_hooks::stamps() else {
+        return;
+    };
+    let mut w = WATCH.with(|c| c.get());
+    // the user is active: fresh hooks every sample, so a hook Windows dropped is back within 3 s
+    if input != w.input {
+        crate::input_hooks::refresh();
+    }
+    let (k, m, slow) = crate::input_hooks::take_report();
+    w.lost = (w.lost.0 + k, w.lost.1 + m);
+    w.slow_ms = w.slow_ms.max(slow);
+    if (w.lost != (0, 0) || w.slow_ms >= 100) && w.noted.is_none_or(|t| t.elapsed().as_secs() >= 600) {
+        note(&format!(
+            "input hooks: Windows had removed keyboard x{} mouse x{} (put back) · slowest callback {} ms",
+            w.lost.0, w.lost.1, w.slow_ms
+        ));
+        w.lost = (0, 0);
+        w.slow_ms = 0;
+        w.noted = Some(Instant::now());
+    }
+    let behind = input.wrapping_sub(event) as i32 > 2000 && event == w.event;
+    if !behind {
+        w.streak = 0;
+    } else if input != w.input {
+        w.streak += 1;
+    }
+    w.event = event;
+    w.input = input;
+    if w.streak >= 3 && w.last.is_none_or(|t| t.elapsed().as_secs() >= w.wait) {
+        let soon = w.last.is_some_and(|t| t.elapsed().as_secs() < w.wait * 3);
+        w.wait = if soon { (w.wait * 2).min(3600) } else { 60 };
+        w.last = Some(Instant::now());
+        w.streak = 0;
+        note("input hooks: saw nothing while the system kept getting input, reinstalling");
+        crate::input_hooks::restart();
+    }
+    WATCH.with(|c| c.set(w));
 }

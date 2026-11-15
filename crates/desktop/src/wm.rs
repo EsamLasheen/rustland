@@ -59,8 +59,6 @@ const MSG_DRAG_MOVE: u32 = WM_APP + 3;
 const MSG_DRAG_RESIZE: u32 = WM_APP + 4;
 const MSG_DRAG_UPDATE: u32 = WM_APP + 5;
 const MSG_DRAG_END: u32 = WM_APP + 6;
-const TIMER_HOVER: usize = 1;
-const HOVER_DELAY_MS: u32 = 60;
 const SUPPRESS_TTL: Duration = Duration::from_millis(400);
 const SUPPRESS_CAP: usize = 256;
 const BACKLOG_CAP: usize = 256;
@@ -83,7 +81,7 @@ const SHELL_CLASSES: &[&str] = &[
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
 static NOTIFY: AtomicIsize = AtomicIsize::new(0);
 static POINTER: AtomicU64 = AtomicU64::new(0);
-/// The hover timer is running; pointer moves need no message until it settles.
+/// A pointer message is queued; further moves only update POINTER until it is handled.
 static HOVER_ARMED: AtomicBool = AtomicBool::new(false);
 static DRAG_POINT: AtomicU64 = AtomicU64::new(0);
 static DRAG_PENDING: AtomicBool = AtomicBool::new(false);
@@ -138,7 +136,16 @@ impl Wm {
         let (tx, rx) = mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("monarch-wm".into())
-            .spawn(move || run(tx))?;
+            .spawn(move || {
+                // focus changes should follow the hand even while other programs load the CPU
+                unsafe {
+                    let _ = windows::Win32::System::Threading::SetThreadPriority(
+                        windows::Win32::System::Threading::GetCurrentThread(),
+                        windows::Win32::System::Threading::THREAD_PRIORITY_ABOVE_NORMAL,
+                    );
+                }
+                run(tx)
+            })?;
         match rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 thread: Some(thread),
@@ -183,9 +190,8 @@ pub fn perform(action: WmAction) -> bool {
 }
 
 /// Focus-follows-mouse input: call for every pointer move (screen coordinates, physical
-/// pixels as delivered to WH_MOUSE_LL). Coalesced; never blocks. A tiled window under a
-/// pointer that rested for ~60 ms is focused. Only the first move after the pointer
-/// settled posts a message; it arms one timer that re-checks the position when it fires.
+/// pixels as delivered to WH_MOUSE_LL). Coalesced; never blocks. The tiled window the pointer
+/// enters is focused at once, without waiting for it to stop. At most one message is queued.
 pub fn pointer_moved(x: i32, y: i32) {
     POINTER.store(pack(x, y), Ordering::SeqCst);
     if !HOVER_ARMED.swap(true, Ordering::SeqCst) && !post(MSG_POINTER, 0, 0) {
@@ -318,7 +324,6 @@ enum Event {
     Win(u32, isize),
     Action(WmAction),
     Pointer,
-    Hover,
     DragBegin(isize, (i32, i32), DragKind),
     DragUpdate((i32, i32)),
     DragEnd((i32, i32)),
@@ -381,7 +386,7 @@ fn run(ready: mpsc::SyncSender<io::Result<()>>) {
                 monarch_platform::log(&p, &format!("WM recovery: {e}"));
             }
         }
-        let mut engine = Engine::new(window);
+        let mut engine = Engine::new();
         engine.hooks = install_hooks();
         if engine.hooks.is_empty() {
             let _ = DestroyWindow(window);
@@ -493,7 +498,6 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             )));
         }
         MSG_DRAG_END => dispatch(Event::DragEnd(unpack(w.0 as u64))),
-        WM_TIMER if w.0 == TIMER_HOVER => dispatch(Event::Hover),
         WM_DISPLAYCHANGE => dispatch(Event::Display),
         WM_SETTINGCHANGE if w.0 == SPI_SETWORKAREA.0 as usize => dispatch(Event::Display),
         WM_CLOSE => {
@@ -608,7 +612,7 @@ unsafe extern "system" fn find_foreign_child(h: HWND, l: LPARAM) -> BOOL {
 }
 
 /// Executable of a window; UWP frames report the hosted app instead of ApplicationFrameHost.
-unsafe fn window_exe(h: HWND, pid: u32) -> String {
+pub(crate) unsafe fn window_exe(h: HWND, pid: u32) -> String {
     let exe = process_exe(pid);
     if exe_is(&exe, "ApplicationFrameHost") {
         let mut state = (pid, 0u32);
@@ -695,13 +699,64 @@ unsafe fn in_modal_ui(h: HWND) -> bool {
     GetGUIThreadInfo(thread, &mut info).is_ok() && info.flags.0 & busy != 0
 }
 
+/// Window rects saved by [`toggle_maximize`] (window → rect before going fullscreen).
+static FULL: Mutex<Vec<(isize, RECT)>> = Mutex::new(Vec::new());
+
+/// Win+M: the window alone fills its whole monitor — over the bar, which hides itself while a
+/// fullscreen window is in front — and the same keys put it back where it was (its tile).
 unsafe fn toggle_maximize(h: HWND) {
-    let cmd = if IsZoomed(h).as_bool() {
-        SW_RESTORE
-    } else {
-        SW_MAXIMIZE
+    if IsHungAppWindow(h).as_bool() {
+        return; // resizing it would block this thread until the app recovers
+    }
+    let mut full = FULL.lock().unwrap_or_else(|e| e.into_inner());
+    full.retain(|(k, _)| IsWindow(Some(hwnd(*k))).as_bool());
+    if let Some(i) = full.iter().position(|(k, _)| *k == h.0 as isize) {
+        let (_, r) = full.remove(i);
+        let _ = SetWindowPos(
+            h,
+            None,
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS,
+        );
+        return;
+    }
+    if IsZoomed(h).as_bool() {
+        let _ = ShowWindow(h, SW_RESTORE);
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
     };
-    let _ = ShowWindowAsync(h, cmd);
+    let (Some((wr, vr)), true) = (
+        frame(h),
+        GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut info).as_bool(),
+    ) else {
+        return;
+    };
+    if full.len() >= 64 {
+        full.remove(0);
+    }
+    full.push((h.0 as isize, wr));
+    // the invisible resize borders stay outside the monitor, so the visible frame fills it exactly
+    let m = info.rcMonitor;
+    let (l, t, r, b) = (
+        vr.left - wr.left,
+        vr.top - wr.top,
+        wr.right - vr.right,
+        wr.bottom - vr.bottom,
+    );
+    let _ = SetWindowPos(
+        h,
+        Some(HWND_TOP),
+        m.left - l,
+        m.top - t,
+        m.right - m.left + l + r,
+        m.bottom - m.top + t + b,
+        SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS,
+    );
 }
 
 /// Windows only lets the process that received the last input take the foreground. An
@@ -747,7 +802,7 @@ unsafe extern "system" fn collect_monitor(m: HMONITOR, _dc: HDC, _r: *mut RECT, 
 }
 
 /// The window covers its whole monitor, taskbar area included (borderless fullscreen).
-unsafe fn covers_monitor(h: HWND) -> bool {
+pub(crate) unsafe fn covers_monitor(h: HWND) -> bool {
     let mut info = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
@@ -809,7 +864,6 @@ struct MoveSize {
 
 struct Engine {
     model: Model,
-    window: HWND,
     started: Instant,
     own_pid: u32,
     hooks: Vec<HWINEVENTHOOK>,
@@ -829,20 +883,19 @@ struct Engine {
     movesize: Option<MoveSize>,
     /// This process is elevated (then elevated windows can be managed).
     elevated: bool,
-    /// Pointer position at the previous hover tick.
-    hover_pos: u64,
     /// Root window under the pointer at the last settled hover.
     last_hover: isize,
     bar_dirty: bool,
+    /// The foreground window covers its monitor (the shell's bar hides meanwhile).
+    fg_full: bool,
 }
 
 impl Engine {
-    unsafe fn new(window: HWND) -> Self {
+    unsafe fn new() -> Self {
         let mons = read_monitors();
         let works: Vec<Rect> = mons.iter().map(|(_, r)| *r).collect();
         Self {
             model: Model::new(Config::default(), &works),
-            window,
             started: Instant::now(),
             own_pid: GetCurrentProcessId(),
             hooks: Vec::new(),
@@ -857,9 +910,9 @@ impl Engine {
             drag: None,
             movesize: None,
             elevated: process_elevated(GetCurrentProcessId()),
-            hover_pos: 0,
             last_hover: 0,
             bar_dirty: false,
+            fg_full: false,
         }
     }
 
@@ -869,8 +922,7 @@ impl Engine {
                 Event::Startup => self.startup(),
                 Event::Win(event, key) => self.on_win(event, key),
                 Event::Action(a) => self.action(a),
-                Event::Pointer => self.arm_hover(),
-                Event::Hover => self.hover_tick(),
+                Event::Pointer => self.pointer_moved(),
                 Event::DragBegin(key, pt, kind) => self.drag_begin(key, pt, kind),
                 Event::DragUpdate(pt) => self.drag_update(pt),
                 Event::DragEnd(pt) => self.drag_end(pt),
@@ -1022,7 +1074,8 @@ impl Engine {
         let n = class_of(h, &mut cbuf);
         let class = String::from_utf16_lossy(&cbuf[..n]);
         let mut tbuf = [0u16; 512];
-        let n = GetWindowTextW(h, &mut tbuf).max(0) as usize;
+        // no message to the window: a hung app must not stall the window manager
+        let n = InternalGetWindowText(h, &mut tbuf).max(0) as usize;
         let title = String::from_utf16_lossy(&tbuf[..n]);
         let Some((_, vr)) = frame(h) else {
             return;
@@ -1095,6 +1148,16 @@ impl Engine {
         let h = hwnd(key);
         let wid = id(h);
         let managed = self.model.window(wid).is_some();
+        if matches!(event, EVENT_OBJECT_LOCATIONCHANGE | EVENT_SYSTEM_FOREGROUND) {
+            let fg = GetForegroundWindow();
+            if event == EVENT_SYSTEM_FOREGROUND || fg == h {
+                let full = covers_monitor(fg) && !self.is_shell(fg);
+                if full != self.fg_full {
+                    self.fg_full = full;
+                    self.bar_dirty = true; // the bar re-checks fullscreen on the state message
+                }
+            }
+        }
         if managed && event != EVENT_OBJECT_LOCATIONCHANGE && crate::runtime::debug_enabled() {
             if let Ok(p) = crate::platform::paths() {
                 crate::platform::log(
@@ -1195,35 +1258,27 @@ impl Engine {
         }
     }
 
-    /// First pointer move after the pointer settled: start the (single) hover timer.
-    unsafe fn arm_hover(&mut self) {
-        self.hover_pos = POINTER.load(Ordering::SeqCst);
-        SetTimer(Some(self.window), TIMER_HOVER, HOVER_DELAY_MS, None);
-    }
-
-    /// Hover timer tick: keep ticking while the pointer moves; once it rested for a full
-    /// period, stop the timer and run focus-follows-mouse.
-    unsafe fn hover_tick(&mut self) {
-        let pos = POINTER.load(Ordering::SeqCst);
-        if pos != self.hover_pos {
-            self.hover_pos = pos;
-            return;
-        }
-        let _ = KillTimer(Some(self.window), TIMER_HOVER);
+    /// Clear the flag first: a move after this line queues a new message, so none is lost.
+    unsafe fn pointer_moved(&mut self) {
         HOVER_ARMED.store(false, Ordering::SeqCst);
-        // A move that raced with disarming must not be lost.
-        if POINTER.load(Ordering::SeqCst) != pos {
-            if !HOVER_ARMED.swap(true, Ordering::SeqCst) {
-                self.arm_hover();
-            }
-            return;
-        }
-        self.hover(pos);
+        self.hover(POINTER.load(Ordering::SeqCst));
     }
 
-    /// Focus-follows-mouse after the pointer rested for HOVER_DELAY_MS.
+    /// Focus-follows-mouse: the pointer entered another window.
     unsafe fn hover(&mut self, pos: u64) {
         if self.drag.is_some() {
+            return;
+        }
+        let (x, y) = unpack(pos);
+        // this runs for every mouse report: still inside the same window is the cheap common case
+        let mut last = RECT::default();
+        if self.last_hover != 0
+            && GetWindowRect(hwnd(self.last_hover), &mut last).is_ok()
+            && x >= last.left
+            && x < last.right
+            && y >= last.top
+            && y < last.bottom
+        {
             return;
         }
         for vk in [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON] {
@@ -1231,7 +1286,6 @@ impl Engine {
                 return;
             }
         }
-        let (x, y) = unpack(pos);
         let Some(h) = root_at(x, y) else {
             return;
         };
@@ -1553,7 +1607,12 @@ impl Engine {
         for _ in 0..FLUSH_ROUNDS {
             if self.model.journal_mut().take_dirty() {
                 self.sync_slots();
-                self.persist();
+                if let Err(error) = self.persist() {
+                    self.model.journal_mut().retry_persist();
+                    // Do not hide additional windows without a durable recovery record.
+                    self.out.retain(|effect| !matches!(effect, Effect::Hide(_)));
+                    if let Ok(paths) = crate::platform::paths() { crate::platform::log(&paths, &format!("window recovery record: {error}")); }
+                }
             }
             if self.out.is_empty() {
                 break;
@@ -1602,25 +1661,20 @@ impl Engine {
         }
     }
 
-    fn persist(&self) {
-        let Ok(path) = journal_path() else {
-            return;
-        };
+    fn persist(&self) -> io::Result<()> {
+        let path = journal_path()?;
         let journal = self.model.journal();
         if journal.is_empty() {
-            let _ = fs::remove_file(&path);
-            return;
+            return match fs::remove_file(&path) { Ok(()) => Ok(()), Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()), Err(e) => Err(e) };
         }
-        let Ok(bytes) = journal.to_bytes() else {
-            return;
-        };
+        let bytes = journal.to_bytes()?;
         if let Some(dir) = path.parent() {
-            let _ = fs::create_dir_all(dir);
+            fs::create_dir_all(dir)?;
         }
         let temp = path.with_extension("pending.json");
-        if fs::write(&temp, &bytes).is_ok() {
-            let _ = fs::rename(&temp, &path);
-        }
+        { use std::io::Write; let mut file = fs::File::create(&temp)?; file.write_all(&bytes)?; file.sync_all()?; }
+        let (src, dst) = (crate::platform::wide(&temp), crate::platform::wide(&path));
+        unsafe { windows::Win32::Storage::FileSystem::MoveFileExW(windows::core::PCWSTR(src.as_ptr()), windows::core::PCWSTR(dst.as_ptr()), windows::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING | windows::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH).map_err(io::Error::other) }
     }
 
     fn publish(&self) {
@@ -1739,7 +1793,6 @@ impl Engine {
         for hook in self.hooks.drain(..) {
             let _ = UnhookWinEvent(hook);
         }
-        let _ = KillTimer(Some(self.window), TIMER_HOVER);
         HOVER_ARMED.store(false, Ordering::SeqCst);
         for e in self.model.journal_mut().drain() {
             let h = hwnd(e.hwnd as isize);
@@ -1749,7 +1802,7 @@ impl Engine {
         }
         self.model.journal_mut().take_dirty();
         self.sync_slots();
-        self.persist();
+        let _ = self.persist();
         BAR.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }

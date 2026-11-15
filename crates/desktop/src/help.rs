@@ -195,10 +195,12 @@ fn paint(h: HWND) {
 unsafe extern "system" fn proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_KEYDOWN if wp.0 as u16 == 0x1B => {
+            crate::render::release_surface(h);
             let _ = DestroyWindow(h);
             LRESULT(0)
         }
         WM_LBUTTONUP | WM_RBUTTONUP => {
+            crate::render::release_surface(h);
             let _ = DestroyWindow(h);
             LRESULT(0)
         }
@@ -207,6 +209,7 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             LRESULT(0)
         }
         WM_CLOSE => {
+            crate::render::release_surface(h);
             let _ = DestroyWindow(h);
             LRESULT(0)
         }

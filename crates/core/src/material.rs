@@ -499,6 +499,10 @@ impl Scheme {
 }
 
 /// `#rrggbb`
+pub fn theme_source_color(px: &[u8], w: usize, h: usize, bgra: bool) -> [u8; 3] {
+    source_color(px, w, h, bgra).unwrap_or([128, 128, 128])
+}
+
 pub fn hex(c: [u8; 3]) -> String {
     format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
 }
@@ -515,6 +519,15 @@ pub fn parse_hex(s: &str) -> Option<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn neutral_wallpaper_has_a_fresh_neutral_seed() {
+        let grey = [100, 100, 100, 255].repeat(100);
+        assert_eq!(theme_source_color(&grey, 10, 10, false), [128; 3]);
+        let red = [220, 40, 40, 255].repeat(100);
+        assert_ne!(theme_source_color(&red, 10, 10, false), [128; 3]);
+        assert_eq!(theme_source_color(&grey, 10, 10, false), [128; 3]);
+    }
 
     #[test]
     fn cam16_matches_reference_values() {

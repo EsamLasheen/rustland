@@ -138,6 +138,7 @@ pub fn toggle() {
     let open = L.with(|l| l.borrow().as_ref().map(|x| x.hwnd));
     match open {
         Some(h) => unsafe {
+            crate::render::release_surface(h);
             let _ = DestroyWindow(h);
         },
         None => show(),
@@ -413,6 +414,7 @@ fn close() {
     let h = L.with(|l| l.borrow().as_ref().map(|s| s.hwnd));
     if let Some(h) = h {
         unsafe {
+            crate::render::release_surface(h);
             let _ = DestroyWindow(h);
         }
     }
@@ -425,6 +427,7 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             LRESULT(0)
         }
         WM_CLOSE => {
+            crate::render::release_surface(h);
             let _ = DestroyWindow(h);
             LRESULT(0)
         }

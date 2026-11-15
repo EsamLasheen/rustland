@@ -12,6 +12,39 @@ use crate::wallpaper;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock, atomic::{AtomicU64, Ordering}};
+
+static THUMB_GENERATION: AtomicU64 = AtomicU64::new(0);
+type ThumbCache = HashMap<PathBuf, (u64, std::time::SystemTime, Vec<u8>)>;
+static THUMB_CACHE: OnceLock<Mutex<ThumbCache>> = OnceLock::new();
+
+#[cfg(test)]
+mod gallery_tests {
+    use super::*;
+    #[test]
+    fn stale_gallery_result_cannot_replace_current_selection() {
+        let generation = THUMB_GENERATION.fetch_add(2, Ordering::SeqCst) + 2;
+        let stale = Box::into_raw(Box::new(Thumbs { generation: generation - 1, list: vec![(PathBuf::from("old.png"), None)], banner: None }));
+        assert!(take_thumbs(LPARAM(stale as isize), "new.png").is_none());
+        let fresh = Box::into_raw(Box::new(Thumbs { generation, list: vec![(PathBuf::from("new.png"), None)], banner: None }));
+        let (images, _) = take_thumbs(LPARAM(fresh as isize), "new.png").unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].id, "new.png");
+        assert!(images[0].on);
+    }
+}
+
+fn cached_thumb(path: &PathBuf, cache: &mut ThumbCache) -> Option<Vec<u8>> {
+    let meta = std::fs::metadata(path).ok()?;
+    let stamp = meta.modified().ok()?;
+    if let Some((len, modified, pixels)) = cache.get(path) {
+        if *len == meta.len() && *modified == stamp { return Some(pixels.clone()); }
+    }
+    let pixels = wallpaper::thumbnail_rgba(path, 160, 90).ok()?;
+    if cache.len() >= 128 { cache.clear(); }
+    cache.insert(path.clone(), (meta.len(), stamp, pixels.clone()));
+    Some(pixels)
+}
 use windows::Win32::{
     Foundation::*,
     Media::Audio::{
@@ -386,7 +419,7 @@ pub fn ai_hit(hit: &panel::Hit, pn: &mut panel::State) -> bool {
         }
         panel::Hit::AiTest => ai_send(R::TestKey),
         panel::Hit::AiSend => {
-            let attach = S.with(|s| {
+            let attach = pn.ai_capture.is_some() && S.with(|s| {
                 s.borrow()
                     .ai
                     .as_ref()
@@ -404,13 +437,21 @@ pub fn ai_hit(hit: &panel::Hit, pn: &mut panel::State) -> bool {
         }
         panel::Hit::AiClear => {
             pn.ai_prompt.clear();
+            pn.ai_capture = None;
+            pn.ai_response.clear();
+            pn.ai_error.clear();
+            S.with(|s| s.borrow_mut().proposal = None);
             ai_send(R::Clear);
+        }
+        panel::Hit::AiRemoveCapture => {
+            pn.ai_capture = None;
+            ai_send(R::RemoveCapture);
         }
         panel::Hit::AiTheme => {
             // a pending proposal is applied by pressing again (explicit apply, as in the legacy panel)
             if let Some(p) = S.with(|s| s.borrow_mut().proposal.take()) {
-                pn.ai_response = format!("Applied · accent {}", p.accent);
-                APPLY.with(|a| *a.borrow_mut() = Some(p.accent.clone()));
+                pn.ai_response = "تم تطبيق مخطط الألوان بالكامل".into();
+                APPLY.with(|a| *a.borrow_mut() = Some(p));
             } else {
                 ai_send(R::ProposeTheme {
                     brief: pn.ai_prompt.trim().to_string(),
@@ -425,9 +466,9 @@ pub fn ai_hit(hit: &panel::Hit, pn: &mut panel::State) -> bool {
     }
     false
 }
-thread_local! { static APPLY: RefCell<Option<String>> = const { RefCell::new(None) }; }
+thread_local! { static APPLY: RefCell<Option<crate::ai::Palette>> = const { RefCell::new(None) }; }
 /// Accent chosen from an applied AI theme proposal (taken once).
-pub fn take_ai_accent() -> Option<String> {
+pub fn take_ai_accent() -> Option<crate::ai::Palette> {
     APPLY.with(|a| a.borrow_mut().take())
 }
 
@@ -446,7 +487,8 @@ pub fn ai_drain(pn: &mut panel::State) -> bool {
                     pn.ai_response.clear();
                 }
             }
-            E::KeySaved | E::ModelChanged(_) | E::Verified { .. } | E::CaptureCleared => {}
+            E::KeySaved | E::ModelChanged(_) | E::Verified { .. } => {}
+            E::CaptureCleared => pn.ai_capture = None,
             E::Answer { text, .. } => pn.ai_response = text,
             E::ThemeProposal(p) => {
                 pn.ai_response = format!(
@@ -455,7 +497,8 @@ pub fn ai_drain(pn: &mut panel::State) -> bool {
                 );
                 S.with(|s| s.borrow_mut().proposal = Some(p));
             }
-            E::Captured { .. } => {
+            E::Captured { thumb_rgba, width, height, .. } => {
+                pn.ai_capture = Some(image(thumb_rgba, width, height));
                 pn.ai_response =
                     "Screenshot ready · it is sent only with your next question.".into();
                 reopen = true;
@@ -574,22 +617,27 @@ pub fn set_glow_mode(m: &str) {
 
 /// Wallpaper thumbnails for the dashboard: decoded off the UI thread, delivered via WM_THUMBS.
 pub fn load_wallpapers(root: HWND, cfg: &ShellConfig) {
+    let generation = THUMB_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let Some(rr) = rank_root(cfg) else { return };
     let dir = wallpaper::images_dir(&rr, cfg.rank);
     let current = (!cfg.wallpaper.is_empty()).then(|| PathBuf::from(&cfg.wallpaper));
     let raw = root.0 as isize;
     std::thread::spawn(move || {
-        let list: Vec<PathBuf> = wallpaper::list_images(&dir).into_iter().take(12).collect();
+        let mut cache = THUMB_CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+        if generation != THUMB_GENERATION.load(Ordering::SeqCst) { return; }
+        let list = wallpaper::list_images(&dir);
         let current = current.or_else(|| list.first().cloned());
         let thumbs: Vec<(PathBuf, Option<Vec<u8>>)> = list
             .into_iter()
             .map(|p| {
-                let t = wallpaper::thumbnail_rgba(&p, 160, 90).ok();
+                let t = if generation == THUMB_GENERATION.load(Ordering::SeqCst) { cached_thumb(&p, &mut cache) } else { None };
                 (p, t)
             })
             .collect();
+        if generation != THUMB_GENERATION.load(Ordering::SeqCst) { return; }
         let banner = current.and_then(|p| wallpaper::thumbnail_rgba(&p, BANNER.0, BANNER.1).ok());
         let b = Box::into_raw(Box::new(Thumbs {
+            generation,
             list: thumbs,
             banner,
         })) as isize;
@@ -602,6 +650,7 @@ pub fn load_wallpapers(root: HWND, cfg: &ShellConfig) {
 }
 const BANNER: (u32, u32) = (640, 288);
 struct Thumbs {
+    generation: u64,
     list: Vec<(PathBuf, Option<Vec<u8>>)>,
     banner: Option<Vec<u8>>,
 }
@@ -616,8 +665,9 @@ fn image(rgba: Vec<u8>, w: u32, h: u32) -> crate::topbar::Image {
 pub fn take_thumbs(
     l: LPARAM,
     current: &str,
-) -> (Vec<panel::Wallpaper>, Option<crate::topbar::Image>) {
+) -> Option<(Vec<panel::Wallpaper>, Option<crate::topbar::Image>)> {
     let v = unsafe { *Box::from_raw(l.0 as *mut Thumbs) };
+    if v.generation != THUMB_GENERATION.load(Ordering::SeqCst) { return None; }
     S.with(|s| s.borrow_mut().wallpapers = v.list.iter().map(|(p, _)| p.clone()).collect());
     let list = v
         .list
@@ -631,7 +681,7 @@ pub fn take_thumbs(
             }
         })
         .collect();
-    (list, v.banner.map(|b| image(b, BANNER.0, BANNER.1)))
+    Some((list, v.banner.map(|b| image(b, BANNER.0, BANNER.1))))
 }
 
 /// Wallpaper events → (image now shown, its Material source colour, rotation timestamp to persist).
@@ -645,7 +695,10 @@ pub fn take_wallpaper_event(l: LPARAM) -> Option<Shown> {
             rotated,
             at_ms,
             ..
-        } => Some((image, seed, rotated.then_some(at_ms))),
+        } => {
+            crate::runtime::refresh_glass_pane();
+            Some((image, seed, rotated.then_some(at_ms)))
+        }
         wallpaper::Event::Failed { image, error } => {
             log(&format!("wallpaper {}: {error}", image.display()));
             None

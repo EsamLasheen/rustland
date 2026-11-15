@@ -53,6 +53,12 @@ pub fn run() -> std::io::Result<()> {
             return Ok(());
         }
         if status.code() == Some(FATAL_EXIT) {
+            let _ = crate::wm::recover();
+            crate::winglass::give_back_after_crash(
+                crate::config::Store::open()
+                    .map(|s| s.config.window_opacity)
+                    .unwrap_or(crate::winglass::DEFAULT_OPACITY),
+            );
             crate::taskbar::restore_after_crash();
             return Err(std::io::Error::other(
                 "RustLand could not start. Details are in session.log.",
@@ -68,7 +74,13 @@ pub fn run() -> std::io::Result<()> {
             crashes.len()
         ));
         if crashes.len() >= MAX_CRASHES || hourly.len() >= 10 {
+            let _ = crate::wm::recover();
             // give the desktop back rather than crash-looping
+            crate::winglass::give_back_after_crash(
+                crate::config::Store::open()
+                    .map(|s| s.config.window_opacity)
+                    .unwrap_or(crate::winglass::DEFAULT_OPACITY),
+            );
             crate::taskbar::restore_after_crash();
             return Err(std::io::Error::other(
                 "RustLand stopped after repeated crashes. Details are in session.log.",

@@ -61,6 +61,8 @@ pub struct State {
     pub hover: Option<Hit>,
     pub focused_input: Option<Input>,
     pub caret_visible: bool,
+    /// Press feedback: (pressed control, pointer x, y, progress 0..1), panel coordinates.
+    pub ripple: Option<(Rect, f32, f32, f32)>,
     // dashboard
     pub rank: char,
     pub ranks: Vec<(char, Color)>,
@@ -113,10 +115,12 @@ pub struct State {
     pub dynamic_accent: bool,
     pub reduce_motion: bool,
     pub glass: bool,
+    pub window_glass: bool,
     pub leftbar_autohide: bool,
     pub focus_pulse: String,
     pub rotate_enabled: bool,
     pub version: String,
+    pub config_notice: String,
     // ai
     pub ai_status: String,
     pub ai_key_input: String,
@@ -124,6 +128,7 @@ pub struct State {
     pub ai_response: String,
     pub ai_error: String,
     pub ai_busy: bool,
+    pub ai_capture: Option<Image>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -173,6 +178,7 @@ pub enum Hit {
     AiTest,
     AiSend,
     AiCapture,
+    AiRemoveCapture,
     AiClear,
     AiTheme,
     AiDiagnose,
@@ -217,6 +223,10 @@ struct Ui<'a> {
     w: f32,
     hits: Vec<(Rect, Hit)>,
     card_index: usize,
+    /// Panel slide progress (cards trail it one after another while it opens).
+    slide: f32,
+    /// Cards drawn so far (stagger order, headers included).
+    drawn: usize,
     s: &'a State,
 }
 
@@ -274,6 +284,14 @@ impl<'a> Ui<'a> {
         } else {
             self.container(self.card_index)
         };
+        // opening: each card trails the panel a little more than the one above it
+        let delay = (self.drawn as f32 * 0.07).min(0.45);
+        let local = ((self.slide - delay) / (1. - delay)).clamp(0., 1.);
+        let dx = (1. - crate::fx::ease(local)) * 36.;
+        self.drawn += 1;
+        if dx > 0.5 {
+            self.c.translate(dx, -self.s.scroll);
+        }
         if header {
             self.c.chip(r, Radii::all(12.), self.t.surface_solid, None);
         }
@@ -293,6 +311,9 @@ impl<'a> Ui<'a> {
             );
         }
         body(self, self.y + pad + inner_y, true);
+        if dx > 0.5 {
+            self.c.translate(0., -self.s.scroll);
+        }
         self.y += h + 15.;
     }
     fn btn(&mut self, r: Rect, icon: Option<&str>, label: &str, hit: Hit, draw: bool) {
@@ -601,6 +622,8 @@ pub fn paint(
         w: inner.w - 30.,
         hits: Vec::new(),
         card_index: 0,
+        slide,
+        drawn: 0,
         s,
     };
     match tab {
@@ -628,6 +651,13 @@ pub fn paint(
         }
     }
     c.reset_translation();
+    // press ripple: a ring of light expanding from the pointer inside the pressed control
+    if let Some((r, x, y, p)) = s.ripple {
+        c.push_clip(r);
+        let e = crate::fx::ease(p);
+        c.fill_circle(x, y, 6. + r.w.max(r.h) * e, t.accent.alpha(0.28 * (1. - p)));
+        c.pop_clip();
+    }
     c.pop_clip();
     c.pop_clip();
     (hits, (content_h - view.h).max(0.))
@@ -872,7 +902,7 @@ fn dashboard(ui: &mut Ui) {
                 cw,
                 31.,
             );
-            let on = *n == s.preset || (s.preset.is_empty() && i == 0);
+            let on = !s.dynamic_accent && (*n == s.preset || (s.preset.is_empty() && i == 0));
             let label = if n == "ShadowMonarch" {
                 "Shadow Monarch".to_string()
             } else {
@@ -947,8 +977,8 @@ fn dashboard(ui: &mut Ui) {
         if draw {
             ui.kicker(
                 &format!(
-                    "NIBRAS + RANK {} · WALLPAPERS · EVERY {}H",
-                    s.rank, s.rotate_hours
+                    "WALLPAPERS · {} IMAGES · EVERY {}H",
+                    s.wallpapers.len(), s.rotate_hours
                 ),
                 Rect::new(ui.x + 14., y0, ui.w - 28. - bw - 8., 34.),
                 t.accent,
@@ -1983,6 +2013,13 @@ fn power(ui: &mut Ui) {
 }
 
 fn settings(ui: &mut Ui) {
+    if !ui.s.config_notice.is_empty() {
+        ui.card(Some("SETTINGS RECOVERY"), false, |ui, y, draw| {
+            let h = ui.c.wrapped_height(&ui.s.config_notice, ui.w - 28., &theme::body(12., 400), 21.);
+            if draw { ui.c.text_wrapped(&ui.s.config_notice, ui.x + 14., y, ui.w - 28., &theme::body(12., 400), ui.t.warning, 21.); }
+            h
+        });
+    }
     let s = ui.s;
     let t = *ui.t;
     ui.card(None, false, |ui, y0, draw| {
@@ -2034,6 +2071,14 @@ fn settings(ui: &mut Ui) {
             "ضبابية شفافة خلف الشريط والكبسولة واللوحات.",
             s.glass,
             "glass",
+            draw,
+        );
+        y += ui.toggle_row(
+            y,
+            "نوافذ شفافة",
+            "كل البرامج شفافة شوية، ما عدا الفول سكرين والمستثناة.",
+            s.window_glass,
+            "windowGlass",
             draw,
         );
         y - y0
@@ -2139,6 +2184,12 @@ fn settings(ui: &mut Ui) {
         );
         34.
     });
+    ui.card(Some("RUSTLAND SETUP"), false, |ui, y0, draw| {
+        let label = "الاسم والمجلد والمدينة والنوافذ";
+        let w = ui.btn_w(false, label).min(ui.w - 28.);
+        ui.btn(Rect::new(ui.x + 14., y0, w, 34.), None, label, Hit::Setting("advanced"), draw);
+        34.
+    });
 }
 
 fn ai(ui: &mut Ui) {
@@ -2204,6 +2255,18 @@ fn ai(ui: &mut Ui) {
         ui.hit(r, Hit::Focus(Input::AiPrompt));
         let mut x = ui.x + 14.;
         let mut y = y0 + 120.;
+        if let Some(im) = &s.ai_capture {
+            let preview = Rect::new(ui.x + 14., y, ui.w - 28., 110.);
+            if draw {
+                ui.c.push_clip(preview);
+                ui.c.image(&im.rgba, im.w, im.h, cover(preview, im.w, im.h), 1.);
+                ui.c.pop_clip();
+            }
+            y += 118.;
+            let bw = ui.btn_w(false, "إزالة الصورة المرفقة");
+            ui.btn(Rect::new(x, y, bw, 34.), None, "إزالة الصورة المرفقة", Hit::AiRemoveCapture, draw);
+            y += 42.;
+        }
         for (label, hit) in [
             ("لقطة شاشة", Hit::AiCapture),
             ("محادثة جديدة", Hit::AiClear),

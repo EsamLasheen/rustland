@@ -159,12 +159,12 @@ pub fn action(verb: &str) {
             }
             "minimize" => {
                 if let Some(h) = fg() {
-                    let _ = ShowWindow(h, SW_MINIMIZE);
+                    let _ = ShowWindowAsync(h, SW_MINIMIZE);
                 }
             }
             "toggle-maximize" => {
                 if let Some(h) = fg() {
-                    let _ = ShowWindow(
+                    let _ = ShowWindowAsync(
                         h,
                         if IsZoomed(h).as_bool() {
                             SW_RESTORE
@@ -192,7 +192,7 @@ unsafe fn unminimize_last() {
             && IsWindowVisible(h).as_bool()
             && GetWindow(h, GW_OWNER).unwrap_or_default().is_invalid()
         {
-            let _ = ShowWindow(h, SW_RESTORE);
+            let _ = ShowWindowAsync(h, SW_RESTORE);
             let _ = SetForegroundWindow(h);
             return;
         }
@@ -290,6 +290,10 @@ pub fn work_area_changed() {
     let _ = wm::perform(WmAction::Retile);
 }
 
+/// A panel or the capsule card is open: focus-follows-mouse waits (it would take the keyboard
+/// from the surface, which then closes as if the user had switched away).
+pub static SURFACE_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Called from the LL mouse hook for every move: drag tracking first, else focus-follows-mouse.
 pub fn mouse_move(p: POINT) {
     let drag = DRAG.load(Ordering::Relaxed);
@@ -306,7 +310,9 @@ pub fn mouse_move(p: POINT) {
         }
         wm::drag_update(p.x, p.y);
     } else {
-        wm::pointer_moved(p.x, p.y);
+        if !SURFACE_OPEN.load(Ordering::Relaxed) {
+            wm::pointer_moved(p.x, p.y);
+        }
     }
 }
 fn win_down() -> bool {

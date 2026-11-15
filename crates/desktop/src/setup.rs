@@ -13,6 +13,7 @@ use windows::{
 };
 
 pub fn install_dir() -> io::Result<PathBuf> {
+    if let Some(root) = crate::platform::portable_root() { return Ok(root.join("app")); }
     Ok(known_folder(&FOLDERID_UserProgramFiles)?.join("MonarchNext"))
 }
 pub fn install() -> io::Result<PathBuf> {
@@ -59,6 +60,8 @@ fn install_into(
         return Ok(target);
     }
     // in-place update; install has already closed a running shell. Settings and data stay.
+    let rollback = dir.join("MonarchNext.previous.exe");
+    if upgrade { fs::copy(&target, &rollback)?; }
     let result = (|| {
         let copied = fs::copy(source, dir.join("MonarchNext.pending.exe"))?;
         if copied != fs::metadata(source)?.len() {
@@ -82,6 +85,7 @@ fn install_into(
         Ok(target.clone())
     })();
     if result.is_err() && upgrade {
+        fs::copy(&rollback, &target)?;
         // never remove a working installation because an update failed
         let _ = fs::remove_file(dir.join("MonarchNext.pending.exe"));
         return result;
@@ -464,5 +468,19 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn failed_upgrade_restores_previous_binary() {
+        let s = Sandbox::new();
+        let source = s.source();
+        let dir = s.root.join("program");
+        let exe = install_into(&source, &dir, &s.root.join("old.lnk"), &s.registry).unwrap();
+        let original = fs::read(&exe).unwrap();
+        let newer = s.root.join("new.exe");
+        fs::write(&newer, b"new version fixture").unwrap();
+        let impossible = s.root.join("absent").join("new.lnk");
+        assert!(install_into(&newer, &dir, &impossible, &s.registry).is_err());
+        assert_eq!(fs::read(&exe).unwrap(), original);
     }
 }

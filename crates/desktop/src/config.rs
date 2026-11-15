@@ -14,6 +14,7 @@ pub struct ShellConfig {
     pub accent: String,
     pub dynamic_accent: bool,
     pub preset: String,
+    pub custom_palette: Option<crate::ai::Palette>,
     pub reduce_motion: bool,
     pub leftbar_autohide: bool,
     pub focus_pulse: String,
@@ -41,6 +42,62 @@ pub struct ShellConfig {
     pub wallpaper_engine: bool,
     /// Frosted-glass surfaces (blur of the desktop behind the bar, capsule and panels).
     pub glass: bool,
+    /// Size of the bar, capsule and panels relative to the system scale (1.0 – 1.5).
+    pub ui_scale: f32,
+    /// Rasto, the little villain in the top bar.
+    pub pet: bool,
+    /// See-through app windows (see `winglass.rs`).
+    pub window_glass: bool,
+    /// Their opacity, 0.6 – 1.0.
+    pub window_opacity: f32,
+    /// Blur the wallpaper behind them.
+    pub window_blur: bool,
+    /// Programs that stay opaque, by file name.
+    pub window_glass_exclude: Vec<String>,
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    fn fixture() -> PathBuf {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("rustland-config-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    #[test]
+    fn corrupt_settings_restore_last_good_and_remain_writable() {
+        let dir = fixture(); let path = dir.join("shell.json");
+        std::fs::write(&path, b"{broken").unwrap();
+        let mut expected = ShellConfig::default(); expected.user_name = "Recovered".into();
+        std::fs::write(dir.join("shell.previous.json"), serde_json::to_vec(&expected).unwrap()).unwrap();
+        let store = Store::at(path.clone());
+        assert!(store.writable); assert_eq!(store.config, expected);
+        store.save().unwrap();
+        assert_eq!(Store::at(path).config, expected);
+        assert!(std::fs::read_dir(&dir).unwrap().any(|p| p.unwrap().file_name().to_string_lossy().contains("corrupt-")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn no_valid_backup_starts_without_changing_desktop() {
+        let dir = fixture(); let path = dir.join("shell.json");
+        std::fs::write(&path, b"invalid").unwrap();
+        let store = Store::at(path.clone());
+        assert!(!store.writable); assert!(!store.config.window_manager); assert!(!store.config.hide_taskbar);
+        assert!(store.save().is_err()); assert_eq!(std::fs::read(path).unwrap(), b"invalid");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+impl ShellConfig {
+    /// `ui_scale` as used: a hand-edited value can not make the shell unusable.
+    pub fn ui_scale_clamped(&self) -> f32 {
+        if self.ui_scale.is_finite() {
+            self.ui_scale.clamp(1., 1.5)
+        } else {
+            1.
+        }
+    }
 }
 
 impl Default for ShellConfig {
@@ -51,6 +108,7 @@ impl Default for ShellConfig {
             accent: "#62baf8".into(),
             dynamic_accent: true,
             preset: "ShadowMonarch".into(),
+            custom_palette: None,
             reduce_motion: false,
             leftbar_autohide: true,
             focus_pulse: "static".into(), // the breathing glow ticks 12x/s: opt-in
@@ -69,6 +127,14 @@ impl Default for ShellConfig {
             hide_taskbar: true,
             wallpaper_engine: true,
             glass: false,
+            ui_scale: 1.,
+            pet: true,
+            window_glass: false, // changes how every program looks: opt-in
+            window_opacity: crate::winglass::DEFAULT_OPACITY,
+            window_blur: true,
+            window_glass_exclude: ["vlc.exe", "mpv.exe", "obs64.exe", "mstsc.exe"]
+                .map(String::from)
+                .to_vec(),
         }
     }
 }
@@ -103,7 +169,7 @@ impl Store {
         Ok(Self::at(path))
     }
     pub fn at(path: PathBuf) -> Self {
-        match std::fs::read(&path) {
+        let mut store = match std::fs::read(&path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Self {
                 path,
                 config: ShellConfig::default(),
@@ -139,7 +205,28 @@ impl Store {
                     error: Some(format!("shell.json is invalid ({e}); original preserved")),
                 },
             },
+        };
+        if !store.writable {
+            // A broken configuration must not unexpectedly take ownership of the desktop.
+            store.config.window_manager = false;
+            store.config.hide_taskbar = false;
+            store.config.window_glass = false;
+            let previous = store.path.with_file_name("shell.previous.json");
+            if let Ok(bytes) = std::fs::read(previous) {
+                if let Ok(c) = serde_json::from_slice::<ShellConfig>(&bytes) {
+                    if c.schema == SCHEMA {
+                        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+                        let preserved = store.path.with_extension(format!("corrupt-{stamp}.json"));
+                        if std::fs::rename(&store.path, preserved).is_ok() {
+                            store.config = c;
+                            store.writable = true;
+                            store.error = Some("Recovered previous settings; original preserved".into());
+                        }
+                    }
+                }
+            }
         }
+        store
     }
     /// Atomic replace (temp file + MoveFileEx), previous version kept as shell.previous.json.
     pub fn save(&self) -> io::Result<()> {

@@ -41,8 +41,32 @@ pub struct State {
     pub ram: Option<f32>,
     pub cpu: Option<f32>,
     pub workspaces: Vec<Workspace>,
+    /// Running micro-animations (see `fx.rs`); default = still.
+    pub fx: Fx,
+    /// Show Rasto beside the meters (false while he is out walking).
+    pub pet: bool,
+    /// Rasto has had enough of being clicked.
+    pub pet_angry: bool,
 }
 
+/// Progress (0..1) of the bar's event animations at the moment of painting.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Fx {
+    /// Energy wave refilling the battery ring while plugged in.
+    pub charge: Option<f32>,
+    /// Flash on reaching a full charge.
+    pub full: Option<f32>,
+    /// Low-battery warning pulse.
+    pub low: Option<f32>,
+    /// Workspace highlight sliding from this bar index.
+    pub slide_from: Option<(usize, f32)>,
+    /// The companion is blinking.
+    pub blink: Option<f32>,
+    /// The companion is hopping (workspace switch, click).
+    pub hop: Option<f32>,
+    /// Where he is looking, -1..1.
+    pub look: f32,
+}
 /// Clickable regions produced by a paint, for hit testing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Hit {
@@ -51,6 +75,7 @@ pub enum Hit {
     Network,
     Monitor,
     Workspace(usize),
+    Pet,
 }
 
 const TRAY_MAX: usize = 7;
@@ -89,6 +114,146 @@ fn letter_tile(c: &Canvas, r: Rect, letter: char, color: Color) {
         color,
         Align::Center,
     );
+}
+
+/// What Rasto's face is doing.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RastoMood {
+    pub blink: Option<f32>,
+    pub grin: bool,
+    pub angry: bool,
+    pub sweat: bool,
+    /// Tail on the left: he is walking left.
+    pub flip: bool,
+    /// Pupils toward this direction, -1..1 on each axis.
+    pub gaze: (f32, f32),
+    /// Walking: phase of his steps (radians).
+    pub step: Option<f32>,
+    /// Just landed: 1 flattens him.
+    pub squash: f32,
+    /// Tail swing, -1..1.
+    pub wag: f32,
+    /// The pointer is too close: wide eyes and a "!".
+    pub scared: bool,
+}
+
+/// Rasto (راستو), the bar's cute little villain: a round imp with horns, a tail, slanted red eyes
+/// and one fang. He blinks, hops with a wider grin when you switch workspace or click him, and
+/// sweats when the CPU is busy.
+pub fn paint_rasto(c: &Canvas, cx: f32, top: f32, t: &Tokens, mood: RastoMood) {
+    let tail = if mood.flip { -1. } else { 1. };
+    let skin = Color::rgba(58, 28, 92, 1.);
+    let horn = Color::rgba(240, 70, 96, 1.);
+    let glow = Color::rgba(255, 62, 86, 1.);
+    let white = Color::rgba(255, 255, 255, 1.);
+    // landing flattens him: same feet, lower head, wider body
+    let sq = mood.squash.clamp(0., 1.);
+    let feet = top + 15.;
+    let top = top + 3. * sq;
+    let (bw, bh) = (18. + 2.5 * sq, 15.5 - 3. * sq);
+    // tail with an arrow tip, behind the body; the tip swings
+    let w = mood.wag * 1.6;
+    c.fill_poly(
+        &[
+            (cx + tail * 6., top + 10.),
+            (cx + tail * 11.5, top + 10.5 + w * 0.5),
+            (cx + tail * 12., top + 8. + w),
+            (cx + tail * 13., top + 9. + w),
+            (cx + tail * 12., top + 12. + w * 0.5),
+            (cx + tail * 6., top + 13.5),
+        ],
+        skin,
+    );
+    c.fill_poly(
+        &[
+            (cx + tail * 10., top + 8.5 + w),
+            (cx + tail * 14., top + 5.5 + w),
+            (cx + tail * 13.5, top + 10. + w),
+        ],
+        horn,
+    );
+    // horns
+    for m in [-1., 1.] {
+        c.fill_poly(
+            &[(cx + m * 7.5, top + 4.), (cx + m * 8.5, top - 4.), (cx + m * 3., top + 0.8)],
+            horn,
+        );
+    }
+    // feet take turns while he walks
+    for m in [-1., 1.] {
+        let lift = mood.step.map_or(0., |p| {
+            let side = if m < 0. { p } else { p + std::f32::consts::PI };
+            side.sin().max(0.) * 2.2
+        });
+        c.fill_circle(cx + m * 4.5, feet - lift, 2.2, skin);
+    }
+    let body = Rect::new(cx - bw / 2., top, bw, bh);
+    let round = Radii {
+        tl: 9.,
+        tr: 9.,
+        br: 7.,
+        bl: 7.,
+    };
+    c.fill_round(body, round, skin);
+    c.bevel(body, round);
+    c.stroke_round(body, round, t.accent.alpha(0.55), 0.8);
+    // eyes: slanted down toward the nose, the villain's look; round when scared
+    let ey = top + 6.5;
+    let open = mood.blink.map_or(1., |p| (2. * p - 1.).abs());
+    let (gx, gy) = mood.gaze;
+    for m in [-1., 1.] {
+        if open < 0.4 {
+            c.fill_poly(
+                &[(cx + m * 6.8, ey - 1.), (cx + m * 1.6, ey + 1.1), (cx + m * 1.6, ey + 2.), (cx + m * 6.8, ey)],
+                glow,
+            );
+        } else if mood.scared {
+            c.fill_circle(cx + m * 4., ey, 3., white);
+            c.fill_circle(cx + m * 4. + gx * 1.2, ey + gy * 1.2, 1.2, glow);
+        } else {
+            c.fill_circle(cx + m * 4.2, ey + 0.6, 3.6, glow.alpha(0.22));
+            c.fill_poly(
+                &[(cx + m * 7., ey - 1.8), (cx + m * 1.5, ey + 0.8), (cx + m * 2.3, ey + 2.6), (cx + m * 6.2, ey + 2.)],
+                glow,
+            );
+            c.fill_circle(cx + m * 3.9 + gx * 1.1, ey + 1.2 + gy * 0.5, 0.8, Color::rgba(255, 225, 120, 1.));
+        }
+    }
+    // smirk, higher on his right, with one fang; wider in mid-air; an "o" when scared
+    let my = top + 11.2;
+    if mood.scared {
+        c.fill_circle(cx, my, 1.6, white);
+    } else {
+        let wide = if mood.grin { 1.5 } else { 0. };
+        c.fill_poly(
+            &[
+                (cx - 3.5 - wide, my + 0.2),
+                (cx + 4.5 + wide, my - 1.3),
+                (cx + 4.5 + wide, my - 0.5),
+                (cx - 3.5 - wide, my + 1.),
+            ],
+            white,
+        );
+        c.fill_poly(&[(cx + 1.2, my - 0.5), (cx + 3.6, my - 1.), (cx + 2.6, my + 2.)], white);
+    }
+    // busy CPU: a drop of sweat
+    if mood.sweat {
+        c.fill_circle(cx - 10., top + 3., 1.6, Color::rgba(140, 215, 255, 0.95));
+    }
+    // annoyed: brows pressed down and steam from the horns
+    if mood.angry && !mood.scared {
+        for m in [-1., 1.] {
+            c.fill_poly(
+                &[(cx + m * 7.5, ey - 3.2), (cx + m * 1.2, ey - 0.4), (cx + m * 1.2, ey + 0.6), (cx + m * 7.5, ey - 2.)],
+                Color::rgba(20, 8, 34, 1.),
+            );
+            c.fill_circle(cx + m * 10.5, top - 1.5, 1.5, Color::rgba(255, 255, 255, 0.7));
+        }
+    }
+    if mood.scared {
+        c.fill_rect(Rect::new(cx + 11., top - 4., 1.8, 5.), Color::rgba(255, 225, 120, 1.));
+        c.fill_circle(cx + 11.9, top + 2.8, 1., Color::rgba(255, 225, 120, 1.));
+    }
 }
 
 /// Paint the bar for a width (DIPs). Returns hit regions.
@@ -299,11 +464,50 @@ pub fn paint(c: &Canvas, width: f32, t: &Tokens, s: &State) -> Vec<(Rect, Hit)> 
     let total: f32 = ws_w.iter().sum::<f32>() + 2. * ws_w.len().saturating_sub(1) as f32;
     let mut wx = rx - total;
     let nws = s.workspaces.len();
+    // workspace switch: the highlight slides from the old workspace to the new one
+    let slide = s.fx.slide_from.and_then(|(from, p)| {
+        let to = s.workspaces.iter().position(|w| w.focused)?;
+        (from != to && from < nws).then_some((from, to, p))
+    });
+    if let Some((from, to, p)) = slide {
+        let xs: Vec<f32> = ws_w
+            .iter()
+            .scan(wx, |x, w| {
+                let at = *x;
+                *x += w + 2.;
+                Some(at)
+            })
+            .collect();
+        for (i, w) in ws_w.iter().enumerate() {
+            c.chip(
+                Rect::new(xs[i], y, *w, h),
+                seg_radii(i, nws),
+                t.surface,
+                Some(t.line_soft),
+            );
+        }
+        let lerp = |a: f32, b: f32| a + (b - a) * p;
+        let r = Rect::new(lerp(xs[from], xs[to]), y, lerp(ws_w[from], ws_w[to]), h);
+        let k = seg_radii(to, nws);
+        // a short accent trail behind the moving highlight
+        let trail = Rect::new(
+            r.x.min(lerp(xs[from], r.x)),
+            y + 2.,
+            (r.x - xs[from]).abs() + r.w,
+            h - 4.,
+        );
+        c.fill_round(trail, Radii::all(R), t.accent.alpha(0.18 * (1. - p)));
+        c.fill_round(r, k, t.accent);
+        c.bevel(r, k);
+    }
     for (i, (ws, w)) in s.workspaces.iter().zip(&ws_w).enumerate() {
         let r = Rect::new(wx, y, *w, h);
         let k = seg_radii(i, nws);
-        let fg = if ws.focused { t.bg } else { t.muted };
-        if ws.focused {
+        let lit = ws.focused && slide.is_none_or(|(_, _, p)| p > 0.5);
+        let fg = if lit { t.bg } else { t.muted };
+        if slide.is_some() {
+            // backgrounds already drawn above
+        } else if ws.focused {
             // --glow: soft accent halo
             for (grow, a) in [(4., 0.10), (2., 0.18)] {
                 c.fill_round(
@@ -318,6 +522,7 @@ pub fn paint(c: &Canvas, width: f32, t: &Tokens, s: &State) -> Vec<(Rect, Hit)> 
                 );
             }
             c.fill_round(r, k, t.accent);
+            c.bevel(r, k);
         } else {
             c.chip(r, k, t.surface, Some(t.line_soft));
         }
@@ -346,12 +551,12 @@ pub fn paint(c: &Canvas, width: f32, t: &Tokens, s: &State) -> Vec<(Rect, Hit)> 
                         Radii::all(4.),
                         t.surface_solid,
                     );
-                    c.fill_round(br, Radii::all(3.), if ws.focused { t.bg } else { t.accent });
+                    c.fill_round(br, Radii::all(3.), if lit { t.bg } else { t.accent });
                     c.text(
                         &label,
                         br,
                         &theme::label(8.5, 700),
-                        if ws.focused { t.accent } else { t.bg },
+                        if lit { t.accent } else { t.bg },
                         Align::Center,
                     );
                 }
@@ -371,7 +576,13 @@ pub fn paint(c: &Canvas, width: f32, t: &Tokens, s: &State) -> Vec<(Rect, Hit)> 
             if charging { "plug" } else { "battery" },
             p / 100.,
             format!("{}%", p.round()),
-            if low { t.warning } else { t.muted },
+            if low {
+                t.warning
+            } else if charging {
+                t.success
+            } else {
+                t.muted
+            },
         ));
     }
     if let Some(v) = s.ram {
@@ -404,7 +615,40 @@ pub fn paint(c: &Canvas, width: f32, t: &Tokens, s: &State) -> Vec<(Rect, Hit)> 
                 c.fill_rect(Rect::new(cx, y + 6., 1., 12.), t.accent.alpha(0.30));
                 cx += 1. + 7.;
             }
-            c.ring(cx + 10., y + h / 2., 20., 2.4, *v, t.faint, *col);
+            let (rx0, ry0) = (cx + 10., y + h / 2.);
+            let battery = i == 0 && s.battery.is_some();
+            let fx = s.fx;
+            // battery HUD: halo behind the ring (charging wave, full flash, low warning)
+            let halo = |p: f32, grow: f32, a: f32, col: Color| {
+                c.fill_circle(
+                    rx0,
+                    ry0,
+                    9. + grow * crate::fx::ease(p),
+                    col.alpha(a * (1. - p)),
+                );
+            };
+            match (battery, fx.full, fx.charge, fx.low) {
+                (true, Some(p), _, _) => halo(p, 6., 0.55, t.success),
+                (true, _, Some(p), _) => halo(p, 4., 0.30, t.success),
+                (true, _, _, Some(p)) => halo(p, 5., 0.45, t.warning),
+                _ => {}
+            }
+            match (battery, fx.charge) {
+                (true, Some(p)) => {
+                    // energy refills the ring from empty to the charge level, a spark at its head
+                    let e = crate::fx::ease(p);
+                    c.ring(rx0, ry0, 20., 2.4, *v * e, t.faint, *col);
+                    let a = std::f32::consts::TAU * (*v * e);
+                    let r0 = (20. - 2.4) / 2.;
+                    c.fill_circle(
+                        rx0 + r0 * a.sin(),
+                        ry0 - r0 * a.cos(),
+                        2.2,
+                        Color::rgba(255, 255, 255, 0.9 * (1. - p * 0.6)),
+                    );
+                }
+                _ => c.ring(rx0, ry0, 20., 2.4, *v, t.faint, *col),
+            }
             c.icon(ic, Rect::new(cx + 5., y + 7., 10., 10.), *col, 2.2);
             c.text(
                 label,
@@ -416,6 +660,20 @@ pub fn paint(c: &Canvas, width: f32, t: &Tokens, s: &State) -> Vec<(Rect, Hit)> 
             cx += cw + 7.;
         }
         hits.push((mr, Hit::Monitor));
+        let pet = Rect::new(mr.x - 30., y, 24., h);
+        if s.pet && pet.x > width / 2. + 206. {
+            let mood = RastoMood {
+                blink: s.fx.blink,
+                grin: s.fx.hop.is_some(),
+                angry: s.pet_angry,
+                sweat: s.cpu.is_some_and(|v| v >= 85.),
+                gaze: (s.fx.look, 0.),
+                ..Default::default()
+            };
+            let hop = s.fx.hop.map_or(0., |p| (p * std::f32::consts::PI).sin() * 3.5);
+            paint_rasto(c, pet.x + pet.w / 2., pet.y + 5.5 - hop, t, mood);
+            hits.push((pet, Hit::Pet));
+        }
     }
     hits
 }
@@ -460,6 +718,9 @@ pub fn sample() -> State {
         battery: Some((80., false)),
         ram: Some(80.),
         cpu: Some(7.),
+        fx: Fx::default(),
+        pet: true,
+        pet_angry: false,
         workspaces: vec![
             ws("1", false, &[]),
             ws("2", false, &[("brave", 1), ("msedge", 1)]),

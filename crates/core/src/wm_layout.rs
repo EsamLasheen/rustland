@@ -677,6 +677,7 @@ impl Journal {
     pub fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
     }
+    pub fn retry_persist(&mut self) { self.dirty = true; }
     pub fn drain(&mut self) -> Vec<JournalEntry> {
         self.dirty |= !self.entries.is_empty();
         std::mem::take(&mut self.entries)

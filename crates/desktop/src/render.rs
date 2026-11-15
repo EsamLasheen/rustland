@@ -299,6 +299,7 @@ impl Gfx {
 
 /// Release the factories while COM is still initialised (thread-local destructors run too late).
 pub fn shutdown() {
+    SURFACES.with(|c| c.borrow_mut().clear());
     MEASURE.with(|m| {
         m.borrow_mut().take();
     });
@@ -441,8 +442,45 @@ impl Canvas {
         }
     }
     /// Box with fill + 1px border (CSS: background + border), the shell's chip.
+    /// Filled polygon (closed automatically).
+    pub fn fill_poly(&self, pts: &[(f32, f32)], c: Color) {
+        let Some((first, rest)) = pts.split_first() else {
+            return;
+        };
+        let p = |q: &(f32, f32)| windows_numerics::Vector2 { X: q.0, Y: q.1 };
+        unsafe {
+            let (Ok(g), Ok(b)) = (self.gfx.d2d.CreatePathGeometry(), self.brush(c)) else {
+                return;
+            };
+            let Ok(sink) = g.Open() else {
+                return;
+            };
+            sink.BeginFigure(p(first), D2D1_FIGURE_BEGIN_FILLED);
+            for q in rest {
+                sink.AddLine(p(q));
+            }
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            if sink.Close().is_ok() {
+                self.rt.FillGeometry(&g, &b, None);
+            }
+        }
+    }
+    /// Raised look: light catching the top edge, shade along the bottom.
+    pub fn bevel(&self, r: Rect, k: Radii) {
+        self.fill_round_vgradient(
+            r,
+            k,
+            &[
+                (0., Color::rgba(255, 255, 255, 0.16)),
+                (0.42, Color::rgba(255, 255, 255, 0.)),
+                (0.62, Color::rgba(0, 0, 0, 0.)),
+                (1., Color::rgba(0, 0, 0, 0.20)),
+            ],
+        );
+    }
     pub fn chip(&self, r: Rect, k: Radii, fill: Color, border: Option<Color>) {
         self.fill_round(r, k, fill);
+        self.bevel(r, k);
         if let Some(b) = border {
             self.stroke_round(r, k, b, 1.)
         }
@@ -746,6 +784,11 @@ impl Canvas {
 
     /// Bitmap from straight RGBA pixels (app icons, wallpaper thumbs).
     pub fn image(&self, rgba: &[u8], w: u32, h: u32, r: Rect, opacity: f32) {
+        let visible = unsafe { self.rt.GetSize() };
+        let mut transform = windows_numerics::Matrix3x2::default();
+        unsafe { self.rt.GetTransform(&mut transform); }
+        let (x, y) = (r.x + transform.M31, r.y + transform.M32);
+        if y + r.h < 0. || y > visible.height || x + r.w < 0. || x > visible.width { return; }
         let mut pm = rgba.to_vec();
         for p in pm.as_chunks_mut::<4>().0 {
             let a = p[3] as u32;
@@ -898,9 +941,8 @@ pub fn measure_with<T>(f: impl FnOnce(&Canvas) -> T) -> Option<T> {
 }
 thread_local! { static MEASURE: RefCell<Option<Canvas>> = const { RefCell::new(None) }; }
 /// Paint a layered (per-pixel alpha) window: render into a DIB and push it with UpdateLayeredWindow.
-/// GDI objects of one present, released on every path (including `?` errors).
+/// GDI objects of a window's frame buffer.
 struct Surface {
-    screen: HDC,
     mem: HDC,
     dib: Option<HBITMAP>,
     old: Option<HGDIOBJ>,
@@ -915,9 +957,68 @@ impl Drop for Surface {
                 let _ = DeleteObject(d.into());
             }
             let _ = DeleteDC(self.mem);
-            ReleaseDC(None, self.screen);
         }
     }
+}
+
+/// Frame buffer and render target of one window, reused from frame to frame: rebuilding them
+/// was most of the cost of an animation frame. Declared in release order (target before DC).
+struct WindowSurface {
+    rt: ID2D1DCRenderTarget,
+    surface: Surface,
+    bits: *mut core::ffi::c_void,
+    key: isize,
+    w: i32,
+    ht: i32,
+    scale: f32,
+}
+thread_local! { static SURFACES: RefCell<Vec<WindowSurface>> = const { RefCell::new(Vec::new()) }; }
+
+unsafe fn new_surface(g: &Gfx, key: isize, w: i32, ht: i32, scale: f32) -> Result<WindowSurface> {
+    let mem = CreateCompatibleDC(None);
+    let mut surface = Surface {
+        mem,
+        dib: None,
+        old: None,
+    };
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -ht,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits = std::ptr::null_mut();
+    let dib = CreateDIBSection(Some(mem), &info, DIB_RGB_COLORS, &mut bits, None, 0)?;
+    surface.dib = Some(dib);
+    surface.old = Some(SelectObject(mem, dib.into()));
+    // software rasterizer: the shell surfaces are small; a hardware target loads the GPU driver (~20 MB)
+    let props = D2D1_RENDER_TARGET_PROPERTIES {
+        r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: 96. * scale,
+        dpiY: 96. * scale,
+        ..Default::default()
+    };
+    let rt = g.d2d.CreateDCRenderTarget(&props)?;
+    rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    Ok(WindowSurface {
+        rt,
+        surface,
+        bits,
+        key,
+        w,
+        ht,
+        scale,
+    })
 }
 
 // ── glass ────────────────────────────────────────────────────────────────────────────────────
@@ -944,6 +1045,22 @@ pub fn set_backdrop(b: Option<Backdrop>) {
     }
 }
 
+/// The blurred wallpaper as RGBA, with its size.
+pub fn backdrop_rgba() -> Option<(Vec<u8>, u32, u32)> {
+    let b = backdrop()?;
+    let mut px = b.px.clone();
+    for p in px.as_chunks_mut::<4>().0 {
+        p.swap(0, 2);
+        p[3] = 255;
+    }
+    Some((px, b.w as u32, b.h as u32))
+}
+
+/// Free a window's frame buffer now (DWM keeps what was pushed): for big surfaces painted rarely.
+pub fn release_surface(h: HWND) {
+    SURFACES.with(|c| c.borrow_mut().retain(|x| x.key != h.0 as isize));
+}
+
 fn backdrop() -> Option<std::sync::Arc<Backdrop>> {
     BACKDROP.lock().ok()?.clone()
 }
@@ -957,37 +1074,45 @@ fn frost_under(px: &mut [u8], w: usize, h: usize, x0: i32, y0: i32, bd: &Backdro
     if bd.w == 0 || bd.h == 0 || bd.px.len() < bd.w * bd.h * 4 {
         return;
     }
+    // per alpha: resulting coverage and the weight of the backdrop (8.8 fixed point)
+    static LUT: std::sync::OnceLock<[(u8, u32); 256]> = std::sync::OnceLock::new();
+    let lut = LUT.get_or_init(|| {
+        std::array::from_fn(|a| {
+            let cov = (a as f32 / FILL).min(1.0);
+            let k = (cov - a as f32 / 255.0).max(0.0);
+            ((cov * 255.0).round() as u8, (k * 256.0).round() as u32)
+        })
+    });
     let s = bd.scale as f32;
-    let sample = |sx: f32, sy: f32| -> [f32; 3] {
-        let fx = (sx / s - 0.5).clamp(0.0, (bd.w - 1) as f32);
-        let fy = (sy / s - 0.5).clamp(0.0, (bd.h - 1) as f32);
-        let (ix, iy) = (fx as usize, fy as usize);
-        let (jx, jy) = ((ix + 1).min(bd.w - 1), (iy + 1).min(bd.h - 1));
-        let (tx, ty) = (fx - ix as f32, fy - iy as f32);
-        let at = |x: usize, y: usize, c: usize| bd.px[(y * bd.w + x) * 4 + c] as f32;
-        let mut o = [0.0; 3];
-        for (c, v) in o.iter_mut().enumerate() {
-            let top = at(ix, iy, c) * (1.0 - tx) + at(jx, iy, c) * tx;
-            let bot = at(ix, jy, c) * (1.0 - tx) + at(jx, jy, c) * tx;
-            *v = top * (1.0 - ty) + bot * ty;
-        }
-        o
+    let split = |v: f32, max: usize| -> (usize, usize, u32) {
+        let f = (v / s - 0.5).clamp(0.0, (max - 1) as f32);
+        let i = f as usize;
+        (i, (i + 1).min(max - 1), ((f - i as f32) * 256.0) as u32)
     };
-    for y in 0..h {
-        for x in 0..w {
-            let o = (y * w + x) * 4;
-            let a = px[o + 3] as f32;
-            if a == 0.0 {
+    // the horizontal sampling positions are the same on every row
+    let xs: Vec<(usize, usize, u32)> = (0..w)
+        .map(|x| split(x0 as f32 + x as f32, bd.w))
+        .collect();
+    for (y, row) in px.chunks_exact_mut(w * 4).take(h).enumerate() {
+        let (iy, jy, ty) = split(y0 as f32 + y as f32, bd.h);
+        let top = &bd.px[iy * bd.w * 4..][..bd.w * 4];
+        let bot = &bd.px[jy * bd.w * 4..][..bd.w * 4];
+        for (p, &(ix, jx, tx)) in row.as_chunks_mut::<4>().0.iter_mut().zip(&xs) {
+            let a = p[3] as usize;
+            if a == 0 {
                 continue;
             }
-            let cov = (a / FILL).min(1.0);
-            let b = sample(x0 as f32 + x as f32, y0 as f32 + y as f32);
-            for c in 0..3 {
-                px[o + c] = (px[o + c] as f32 + b[c] * (cov - a / 255.0).max(0.0))
-                    .round()
-                    .min(255.0) as u8;
+            let (cov, k) = lut[a];
+            p[3] = cov;
+            if k == 0 {
+                continue; // opaque: nothing of the backdrop shows
             }
-            px[o + 3] = (cov * 255.0).round() as u8;
+            for c in 0..3 {
+                let t = top[ix * 4 + c] as u32 * (256 - tx) + top[jx * 4 + c] as u32 * tx;
+                let b = bot[ix * 4 + c] as u32 * (256 - tx) + bot[jx * 4 + c] as u32 * tx;
+                let v = (t * (256 - ty) + b * ty) >> 16;
+                p[c] = (p[c] as u32 + ((v * k + 128) >> 8)).min(255) as u8;
+            }
         }
     }
 }
@@ -998,47 +1123,19 @@ pub fn present(h: HWND, w: i32, ht: i32, scale: f32, paint: impl FnOnce(&Canvas)
     }
     let g = gfx()?;
     unsafe {
-        let screen = GetDC(None);
-        let mem = CreateCompatibleDC(Some(screen));
-        let mut surface = Surface {
-            screen,
-            mem,
-            dib: None,
-            old: None,
+        let key = h.0 as isize;
+        // taken out of the list while painting: a paint may present another surface
+        let cached = SURFACES.with(|c| {
+            let mut c = c.borrow_mut();
+            let i = c.iter().position(|x| x.key == key)?;
+            Some(c.swap_remove(i))
+        });
+        let sf = match cached {
+            Some(x) if x.w == w && x.ht == ht && x.scale == scale => x,
+            _ => new_surface(&g, key, w, ht, scale)?,
         };
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -ht,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut bits = std::ptr::null_mut();
-        let dib = CreateDIBSection(Some(mem), &info, DIB_RGB_COLORS, &mut bits, None, 0)?;
-        surface.dib = Some(dib);
-        surface.old = Some(SelectObject(mem, dib.into()));
-        let props = D2D1_RENDER_TARGET_PROPERTIES {
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            dpiX: 96. * scale,
-            dpiY: 96. * scale,
-            ..Default::default()
-        };
-        // software rasterizer: the shell surfaces are small; a hardware target loads the GPU driver (~20 MB)
-        let props = D2D1_RENDER_TARGET_PROPERTIES {
-            r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-            ..props
-        };
-        let rt = g.d2d.CreateDCRenderTarget(&props)?;
-        rt.BindDC(
-            mem,
+        sf.rt.BindDC(
+            sf.surface.mem,
             &RECT {
                 left: 0,
                 top: 0,
@@ -1046,20 +1143,19 @@ pub fn present(h: HWND, w: i32, ht: i32, scale: f32, paint: impl FnOnce(&Canvas)
                 bottom: ht,
             },
         )?;
-        rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        rt.BeginDraw();
+        sf.rt.BeginDraw();
         let canvas = Canvas {
-            rt: rt.cast()?,
+            rt: sf.rt.cast()?,
             gfx: g.clone(),
         };
         canvas.clear(Color::rgba(0, 0, 0, 0.));
         paint(&canvas);
-        let r = rt.EndDraw(None, None);
+        let r = sf.rt.EndDraw(None, None);
         let mut wr = RECT::default();
         let _ = GetWindowRect(h, &mut wr);
         if GLASS.load(std::sync::atomic::Ordering::Relaxed) {
             if let Some(bd) = backdrop() {
-                let px = std::slice::from_raw_parts_mut(bits as *mut u8, (w * ht * 4) as usize);
+                let px = std::slice::from_raw_parts_mut(sf.bits as *mut u8, (w * ht * 4) as usize);
                 frost_under(px, w as usize, ht as usize, wr.left, wr.top, &bd);
             }
         }
@@ -1077,16 +1173,82 @@ pub fn present(h: HWND, w: i32, ht: i32, scale: f32, paint: impl FnOnce(&Canvas)
         };
         let _ = UpdateLayeredWindow(
             h,
-            Some(screen),
+            None,
             Some(&pos),
             Some(&size),
-            Some(mem),
+            Some(sf.surface.mem),
             Some(&src),
             COLORREF(0),
             Some(&blend),
             ULW_ALPHA,
         );
-        drop(surface);
+        // a failed target is simply rebuilt on the next frame; hidden surfaces give their memory back
+        SURFACES.with(|c| {
+            let mut c = c.borrow_mut();
+            c.retain(|x| IsWindowVisible(HWND(x.key as *mut _)).as_bool());
+            if r.is_ok() {
+                c.push(sf);
+            }
+        });
         r
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// Frame cost of a panel-sized surface with glass on, as an animation would paint it:
+    /// `cargo test --release -p monarch-next bench_present -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_present() {
+        let (bw, bh) = (240usize, 135usize);
+        let mut px = vec![0u8; bw * bh * 4];
+        for (i, p) in px.iter_mut().enumerate() {
+            *p = (i % 251) as u8;
+        }
+        set_glass(true);
+        set_backdrop(Some(Backdrop { w: bw, h: bh, scale: 8, px }));
+        for (name, w, ht) in [("bar", 1920, 43), ("panel", 498, 1037)] {
+            let h = unsafe {
+                CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                    w!("STATIC"),
+                    w!("bench"),
+                    WS_POPUP,
+                    0,
+                    0,
+                    w,
+                    ht,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+            let frames = 300u32;
+            let t0 = std::time::Instant::now();
+            for f in 0..frames {
+                present(h, w, ht, 1.333, |c| {
+                    let bg = Rect::new(0., 0., w as f32 / 1.333, ht as f32 / 1.333);
+                    c.fill_round(bg, Radii::all(12.), Color::rgba(20, 24, 32, 0.8));
+                    for i in 0..24 {
+                        let y = 4. + (i * 30) as f32 + (f % 8) as f32;
+                        let r = Rect::new(8., y.min(bg.h - 26.), 200., 24.);
+                        c.chip(r, Radii::all(8.), Color::rgba(60, 70, 90, 0.6), None);
+                    }
+                })
+                .unwrap();
+            }
+            let ms = t0.elapsed().as_secs_f64() * 1000. / frames as f64;
+            println!("{name} {w}x{ht}: {ms:.2} ms/frame ({:.0} fps max)", 1000. / ms);
+            unsafe {
+                let _ = DestroyWindow(h);
+            }
+        }
+        set_glass(false);
+        set_backdrop(None);
     }
 }

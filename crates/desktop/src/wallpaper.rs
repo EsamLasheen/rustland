@@ -1195,7 +1195,7 @@ fn build_scene(
         }
     }
     let seed = if decoded {
-        material::source_color(frame, w, h, true)
+        Some(material::theme_source_color(frame, w, h, true))
     } else {
         None
     };
@@ -1664,12 +1664,7 @@ impl Engine {
 
     fn reload(&mut self, rotated: bool) {
         let (w, h) = screen_size();
-        // the previous scene and frame are never needed for the next one: free them first
-        self.scene = None;
-        if let Ok(mut s) = self.shared.lock() {
-            s.frame = None;
-            s.patch = None;
-        }
+        // Keep the last good scene until the replacement has decoded successfully.
         let Ok(mut dib) = Dib::new(w, h) else {
             return;
         };
@@ -1683,6 +1678,10 @@ impl Engine {
                 dib.px_mut(),
                 self.wide_clock,
             );
+            if let (Some(error), Some(path)) = (&err, &self.image) {
+                self.emit(Event::Failed { image: path.clone(), error: error.to_string() });
+                return;
+            }
             if err.is_none() && self.dynamic_accent {
                 if let Some(s) = seed {
                     self.accent = color_of(material::Scheme::dark(s).primary);

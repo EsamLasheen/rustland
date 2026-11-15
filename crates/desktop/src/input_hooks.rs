@@ -221,7 +221,85 @@ static JOIN: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::
 /// Low-level hooks run on their own thread whose only job is pumping messages. Windows silently
 /// removes an LL hook whose thread stalls past LowLevelHooksTimeout (~300 ms), so they must never
 /// share the UI thread (startup, window management and painting can take longer than that).
+/// Bar height and the width of the left-edge reveal zone (physical pixels).
+static BAR_BOTTOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(32);
+static EDGE_REACH: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(56);
+pub fn set_edges(bar_bottom: i32, reach: i32) {
+    BAR_BOTTOM.store(bar_bottom, Ordering::Relaxed);
+    EDGE_REACH.store(reach, Ordering::Relaxed);
+}
+
+/// Tick count of the last event either hook saw.
+static LAST_EVENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Windows removes a low-level hook, without telling anyone, when its thread once answers too
+/// slowly; resuming from sleep or hibernate is the usual moment. Shortcuts, focus-follows-mouse and
+/// the edge reveal are then dead until the hooks are installed again. For the watchdog: tick count
+/// of the last event the hooks saw and of the last input the system saw; `None` while off.
+pub fn stamps() -> Option<(u32, u32)> {
+    if THREAD.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    unsafe { GetLastInputInfo(&mut info) }
+        .as_bool()
+        .then(|| (LAST_EVENT.load(Ordering::Relaxed), info.dwTime))
+}
+
+/// Tick of the last swallowed key-down (first press or auto-repeat).
+static SWALLOW_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Hooks that Windows had removed behind our back, found when replacing them (keyboard, mouse).
+static LOST: [std::sync::atomic::AtomicU32; 2] = [const { std::sync::atomic::AtomicU32::new(0) }; 2];
+/// Longest callback since last asked, in microseconds.
+static SLOWEST_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const REHOOK: u32 = WM_APP + 1;
+
+struct Timed(std::time::Instant);
+impl Drop for Timed {
+    fn drop(&mut self) {
+        let us = self.0.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        SLOWEST_US.fetch_max(us, Ordering::Relaxed);
+    }
+}
+
+/// Put fresh hooks in place of the current ones, on the hook thread, new before old: no event
+/// passes unhooked. Windows drops a low-level hook silently once its callback is late (a page
+/// fault under memory pressure is enough), and one late callback also lets that key through to
+/// Windows; replacing the hooks while the user is active bounds the damage to a moment.
+pub fn refresh() {
+    let tid = THREAD.load(Ordering::Relaxed) as u32;
+    if tid != 0 {
+        unsafe {
+            let _ = PostThreadMessageW(tid, REHOOK, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// (keyboard, mouse) hooks found removed since last asked, and the slowest callback in ms.
+pub fn take_report() -> (u32, u32, u32) {
+    (
+        LOST[0].swap(0, Ordering::Relaxed),
+        LOST[1].swap(0, Ordering::Relaxed),
+        SLOWEST_US.swap(0, Ordering::Relaxed) / 1000,
+    )
+}
+
+/// Install the hooks again (they were running).
+pub fn restart() {
+    if THREAD.load(Ordering::Relaxed) != 0 {
+        stop();
+        start(target());
+    }
+}
+
 pub fn start(target: HWND) {
+    LAST_EVENT.store(
+        unsafe { windows::Win32::System::SystemInformation::GetTickCount() },
+        Ordering::Relaxed,
+    );
     TARGET.store(target.0 as isize, Ordering::Relaxed);
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
@@ -229,11 +307,17 @@ pub fn start(target: HWND) {
         .spawn(move || unsafe {
             use windows::Win32::System::Threading::GetCurrentThreadId;
             THREAD.store(GetCurrentThreadId() as u64, Ordering::Relaxed);
+            // every mouse move and key in the system waits for these hooks: on a normal-priority
+            // thread a busy CPU turns into a laggy pointer everywhere. The callbacks are tiny.
+            let _ = windows::Win32::System::Threading::SetThreadPriority(
+                windows::Win32::System::Threading::GetCurrentThread(),
+                windows::Win32::System::Threading::THREAD_PRIORITY_TIME_CRITICAL,
+            );
             let module = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
                 .ok()
                 .map(|m| m.into());
-            let kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb), module, 0);
-            let ms_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(ms), module, 0);
+            let mut kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb), module, 0);
+            let mut ms_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(ms), module, 0);
             let _ = tx.send(format!(
                 "input hooks: keyboard {} · mouse {}",
                 if kb_hook.is_ok() { "ok" } else { "FAILED" },
@@ -241,6 +325,24 @@ pub fn start(target: HWND) {
             ));
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                if msg.hwnd.0.is_null() && msg.message == REHOOK {
+                    let fresh = [
+                        SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb), module, 0),
+                        SetWindowsHookExW(WH_MOUSE_LL, Some(ms), module, 0),
+                    ];
+                    for (i, (old, new)) in [&mut kb_hook, &mut ms_hook].into_iter().zip(fresh).enumerate() {
+                        if new.is_err() {
+                            continue; // keep what we have
+                        }
+                        if let Ok(o) = std::mem::replace(old, new) {
+                            // the handle is gone when Windows removed the hook itself
+                            if UnhookWindowsHookEx(o).is_err() {
+                                LOST[i].fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
@@ -298,10 +400,13 @@ unsafe fn mask_win() {
 }
 
 unsafe extern "system" fn kb(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+    let _timed = Timed(std::time::Instant::now());
     if code < 0 {
         return CallNextHookEx(None, code, w, l);
     }
     let d = &*(l.0 as *const KBDLLHOOKSTRUCT);
+    // not `d.time`: some devices and injected events report 0 or a stale stamp
+    LAST_EVENT.store(windows::Win32::System::SystemInformation::GetTickCount(), Ordering::Relaxed);
     if d.dwExtraInfo == MARK || d.vkCode >= 256 {
         return CallNextHookEx(None, code, w, l);
     }
@@ -356,7 +461,14 @@ unsafe extern "system" fn kb(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     }
     // auto-repeat of a swallowed key: keep swallowing, do not re-fire
     if word.load(Ordering::Relaxed) & bit != 0 {
-        return LRESULT(1);
+        // A real auto-repeat follows the previous event within the repeat delay (1 s at most).
+        // Later than that, the key-up was lost (focus went to an elevated window or the secure
+        // desktop while the key was down) and this is a new press: it must fire, not vanish.
+        let now = windows::Win32::System::SystemInformation::GetTickCount();
+        if now.wrapping_sub(SWALLOW_TICK.swap(now, Ordering::Relaxed)) < 1500 {
+            return LRESULT(1);
+        }
+        word.fetch_and(!bit, Ordering::Relaxed);
     }
     if crate::runtime::debug_enabled() {
         if let Ok(p) = crate::platform::paths() {
@@ -383,23 +495,30 @@ unsafe extern "system" fn kb(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
         return CallNextHookEx(None, code, w, l);
     }
     word.fetch_or(bit, Ordering::Relaxed);
+    SWALLOW_TICK.store(
+        windows::Win32::System::SystemInformation::GetTickCount(),
+        Ordering::Relaxed,
+    );
     WIN_USED.store(true, Ordering::Relaxed);
     crate::runtime::post_cmd(to_cmd(b.act));
     LRESULT(1)
 }
 
 unsafe extern "system" fn ms(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+    let _timed = Timed(std::time::Instant::now());
     if code >= 0 {
         let d = &*(l.0 as *const MSLLHOOKSTRUCT);
+        // not `d.time`: some devices and injected events report 0 or a stale stamp
+    LAST_EVENT.store(windows::Win32::System::SystemInformation::GetTickCount(), Ordering::Relaxed);
         match w.0 as u32 {
             WM_MOUSEMOVE => {
                 // left-edge reveal: x <= 0 shows, beyond the bar + panel gap hides
                 let near = EDGE_NEAR.load(Ordering::Relaxed);
                 // primary monitor only (it starts at x = 0): a monitor on the left has negative x
                 let now = if near {
-                    (0..=56).contains(&d.pt.x)
+                    (0..=EDGE_REACH.load(Ordering::Relaxed)).contains(&d.pt.x)
                 } else {
-                    d.pt.x == 0 && d.pt.y > 32
+                    d.pt.x == 0 && d.pt.y > BAR_BOTTOM.load(Ordering::Relaxed)
                 };
                 if now != near {
                     EDGE_NEAR.store(now, Ordering::Relaxed);

@@ -170,7 +170,7 @@ pub enum Request {
 }
 
 /// Validated palette proposal (lowercase `#rrggbb`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Palette {
     pub accent: String,
     pub bg: String,
@@ -264,6 +264,7 @@ impl Ai {
         let key_path = data.join("gemini.key");
         let config_path = data.join("gemini.json");
         let session = Session {
+            capture_revision: 0,
             has_key: key_path.is_file(),
             verified_at: None,
             model: load_model(&config_path).unwrap_or("auto"),
@@ -384,12 +385,21 @@ struct Shot {
 }
 
 struct Session {
+    capture_revision: u64,
     has_key: bool,
     verified_at: Option<u64>,
     model: &'static str,
     /// (is_user, text), at most `HISTORY_TURNS` entries.
     history: Vec<(bool, String)>,
     capture: Option<Shot>,
+}
+
+impl Session {
+    fn clear_conversation(&mut self) {
+        self.history.clear();
+        self.capture = None;
+        self.capture_revision = self.capture_revision.wrapping_add(1);
+    }
 }
 
 struct Shared {
@@ -507,14 +517,19 @@ fn handle(shared: &Arc<Shared>, req: Request, queue: &SyncSender<Msg>) {
             None => shared.publish(Event::Error(E_CONFIG.into())),
         },
         Request::Clear => {
-            shared.session().history.clear();
+            {
+                let mut session = shared.session();
+                session.clear_conversation();
+            }
+            shared.publish(Event::CaptureCleared);
             shared.publish(Event::Cleared);
         }
         Request::RemoveCapture => {
-            shared.session().capture = None;
+            { let mut session = shared.session(); session.capture = None; session.capture_revision = session.capture_revision.wrapping_add(1); }
             shared.publish(Event::CaptureCleared);
         }
         Request::Capture => {
+            let revision = shared.session().capture_revision;
             let s = Arc::clone(shared);
             let q = queue.clone();
             let spawned = std::thread::Builder::new()
@@ -526,7 +541,9 @@ fn handle(shared: &Arc<Shared>, req: Request, queue: &SyncSender<Msg>) {
                     match shot {
                         Some(shot) if shot.jpeg.len() <= MAX_IMAGE => {
                             let at = now_ms();
-                            s.session().capture = Some(Shot {
+                            let mut session = s.session();
+                            if session.capture_revision != revision { return; }
+                            session.capture = Some(Shot {
                                 jpeg: shot.jpeg,
                                 at,
                                 expires: Instant::now() + CAPTURE_TTL,
@@ -1386,6 +1403,17 @@ unsafe fn encode_capture(bmp: HBITMAP, w: u32, h: u32) -> windows::core::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_conversation_removes_capture_and_invalidates_inflight_capture() {
+        let mut session = Session { capture_revision: 7, has_key: false, verified_at: None, model: AUTO_MODEL,
+            history: vec![(true, "old question".into())],
+            capture: Some(Shot { jpeg: vec![1,2,3], at: 1, expires: Instant::now() + CAPTURE_TTL }) };
+        session.clear_conversation();
+        assert!(session.history.is_empty());
+        assert!(session.capture.is_none());
+        assert_eq!(session.capture_revision, 8);
+    }
 
     #[test]
     fn api_key_headers_exact_and_wipeable() {

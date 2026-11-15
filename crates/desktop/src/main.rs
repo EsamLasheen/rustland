@@ -8,6 +8,10 @@ mod appicons;
 mod capsule;
 mod config;
 mod focus_watch;
+mod fx;
+mod pacer;
+mod rasto;
+mod winglass;
 mod glow;
 mod help;
 mod icons;
@@ -62,6 +66,7 @@ fn main() {
         Some("--diagnostics") => diagnostics(args.get(1)),
         Some("--benchmark") => benchmark(args.get(1)),
         Some("--feature-audit") => feature_audit(args.get(1)),
+        Some("--appbar") => runtime::appbar_helper(args.get(1), args.get(2), args.get(3)),
         Some("--shell") => supervisor::run(),
         Some("--shell-child") => runtime::run(),
         Some("--render") => render_snapshot(args.get(1), args.get(2), args.get(3)),
@@ -143,11 +148,12 @@ fn run_setup() -> std::io::Result<()> {
 fn diagnostics(output: Option<&String>) -> std::io::Result<()> {
     let output = output.ok_or_else(|| std::io::Error::other("Provide an output JSON path"))?;
     let p = platform::paths()?;
-    let config = monarch_core::Settings::load(&p.settings);
+    let config = config::Store::open()?;
     let features = serde_json::json!({"topBar":true,"appbarReservation":true,"tray":true,"workspaces":true,"smartCapsule":true,"mediaSessions":true,"weather":true,"focusTimer":true,"leftBar":true,"panels":10,"wifiManager":true,"radios":true,"brightness":true,"volume":true,"processes":true,"disks":true,"alerts":true,"networkUsage":true,"clipboardHistory":true,"todo":true,"power":true,"launcher":true,"calculator":true,"tilingWindowManager":true,"wallpaper":true,"dynamicAccent":true,"focusGlow":true,"taskbarHidden":true,"gemini":true,"crashRecovery":true,"autostart":true});
     let report = serde_json::json!({
         "product":"RustLand", "version":env!("CARGO_PKG_VERSION"), "architecture":std::env::consts::ARCH,
-        "settingsPath":p.settings, "settingsValid":config.is_ok(), "settingsError":config.err().map(|e|e.to_string()),
+        "settingsPath":p.data.join("shell.json"), "settingsValid":config.writable, "settingsError":config.error,
+        "activeSettings": {"wallpaper":config.config.wallpaper_engine,"dynamicAccent":config.config.dynamic_accent,"windowManager":config.config.window_manager,"hideTaskbar":config.config.hide_taskbar},
         "externalProgramsRequired":[], "browserRuntimeRequired":false,
         "shortcutCount":63,
         "implementedShortcutCount":input_hooks::BINDINGS.len(),

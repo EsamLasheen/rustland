@@ -84,6 +84,8 @@ pub struct State {
     pub focus: Option<Focus>,
     pub expanded: bool,
     pub tab: Option<Tab>,
+    /// Arrival effect of the current notice (0..1): its bar fills, a light sweeps across.
+    pub flash: Option<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -239,7 +241,24 @@ pub fn paint_idle(
     } else {
         p.fg
     };
+    // notice arrival ("system message"): its level fills up and a light sweeps across once
+    let arrive = s.flash.filter(|_| s.request.is_some());
+    if let Some(p) = arrive {
+        c.push_clip(r);
+        let x = r.x - 30. + (r.w + 60.) * crate::fx::ease(p);
+        c.fill_round_gradient(
+            Rect::new(x - 28., r.y, 56., r.h),
+            Radii::all(0.),
+            &[
+                (0., Color::rgba(255, 255, 255, 0.)),
+                (0.5, Color::rgba(255, 255, 255, 0.45 * (1. - p))),
+                (1., Color::rgba(255, 255, 255, 0.)),
+            ],
+        );
+        c.pop_clip();
+    }
     if let Some(prog) = s.request.as_ref().and_then(|q| q.progress) {
+        let prog = prog * arrive.map_or(1., crate::fx::ease);
         c.push_clip(r);
         c.fill_round(
             Rect::new(r.x, r.y, r.w * prog.clamp(0., 1.), r.h),

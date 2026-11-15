@@ -121,7 +121,8 @@ pub(crate) fn ssid(handle: &mut Option<HANDLE>) -> Option<String> {
 
 pub(crate) fn window_title(h: HWND) -> String {
     let mut buf = [0u16; 512];
-    let n = unsafe { GetWindowTextW(h, &mut buf) };
+    // never GetWindowTextW: it waits on the window's thread, so a hung app would freeze the bar
+    let n = unsafe { InternalGetWindowText(h, &mut buf) };
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 

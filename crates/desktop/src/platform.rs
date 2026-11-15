@@ -28,7 +28,27 @@ pub fn known_folder(id: &GUID) -> io::Result<PathBuf> {
     }
 }
 pub fn paths() -> io::Result<Paths> {
+    if let Some(root) = portable_root() {
+        let data = root.join("data");
+        return Ok(Paths {
+            settings: data.join("settings.json"),
+            log: data.join("session.log"),
+            recovery: data.join("window-recovery.json"),
+            data,
+        });
+    }
     Ok(Paths::under(&known_folder(&FOLDERID_LocalAppData)?))
+}
+
+/// Explicit opt-in root relative to the executable.
+pub fn portable_root() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let value = std::fs::read_to_string(dir.join("portable-root.txt")).ok()?;
+    let value = value.trim();
+    if value.is_empty() { return None; }
+    let root = dir.join(value).canonicalize().ok()?;
+    root.is_dir().then_some(root)
 }
 
 pub fn log(paths: &Paths, message: &str) {

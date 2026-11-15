@@ -3,7 +3,7 @@
 //! (rounded 8 px, reach 9 px: fits the tile gap). The glow bitmap is drawn only when the target is
 //! resized or the colour / DPI changes (a move only moves the strips); the pulse changes nothing but
 //! the strips' constant alpha (UpdateLayeredWindow, blend only), which DWM composes on the GPU.
-//! Modes: breath (sine, 2.8 s) | heartbeat | static | off. The animation timer (~12 fps) only runs
+//! Modes: breath (sine, 2.8 s) | heartbeat | static | off. The animation timer (~30 fps, ~12 on battery) only runs
 //! while a glow is visible in an animated mode, and pauses while the session is locked or the
 //! display is off (WTS session / GUID_CONSOLE_DISPLAY_STATE notifications). Static / off: no timer.
 #![allow(dead_code)] // Public API is consumed once the integrator wires the module in.
@@ -44,10 +44,23 @@ pub const REACH: i32 = 9;
 /// Windows 11 window corner radius (px at 96 dpi).
 pub const RADIUS: i32 = 8;
 const DEFAULT_COLOR: Color = Color::rgb(0x62, 0xba, 0xf8);
-/// ~12 fps opacity pulse: smooth enough for a 2.8 s breath / 1.4 s beat, a third of the wake-ups of 30 fps.
-const TICK_MS: u32 = 83;
+/// ~30 fps opacity pulse: blend-only updates DWM composes on the GPU, so it costs little and shows no steps.
+const TICK_MS: u32 = 33;
 /// Ticks between safety re-checks of the target (~0.5 s).
-const RECHECK_TICKS: u32 = 6;
+/// On battery every wake-up costs charge: ~12 fps there.
+const TICK_BATTERY_MS: u32 = 83;
+const RECHECK_MS: u32 = 500;
+
+fn pulse_period() -> u32 {
+    use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    let mut s = SYSTEM_POWER_STATUS::default();
+    let on_battery = unsafe { GetSystemPowerStatus(&mut s) }.is_ok() && s.ACLineStatus == 0;
+    if on_battery {
+        TICK_BATTERY_MS
+    } else {
+        TICK_MS
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -316,6 +329,8 @@ struct Glow {
     target_hooks: Vec<HWINEVENTHOOK>,
     global_hooks: Vec<HWINEVENTHOOK>,
     animating: bool,
+    /// Current pulse period (mains or battery).
+    period: u32,
     ticks: u32,
     start: Instant,
     own_pid: u32,
@@ -325,6 +340,14 @@ struct Glow {
     display_off: bool,
     power_note: Option<HPOWERNOTIFY>,
     session_note: bool,
+}
+
+/// Session locked or display off: nobody can see the screen, so no surface should animate.
+static UNSEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True while the screen cannot be seen (locked / display off); animations skip their frames.
+pub fn unseen() -> bool {
+    UNSEEN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// GUID_CONSOLE_DISPLAY_STATE {6FE69556-704A-47A0-8F24-C28D936FDA47}: 0 off, 1 on, 2 dimmed.
@@ -412,7 +435,8 @@ impl Glow {
         if want != self.animating {
             unsafe {
                 if want {
-                    SetTimer(Some(self.host), TIMER_PULSE, TICK_MS, None);
+                    self.period = pulse_period();
+                    SetTimer(Some(self.host), TIMER_PULSE, self.period, None);
                 } else {
                     let _ = KillTimer(Some(self.host), TIMER_PULSE);
                 }
@@ -520,8 +544,16 @@ impl Glow {
     fn tick(&mut self) {
         self.ticks = self.ticks.wrapping_add(1);
         // every ~0.5 s: catch anything the events missed (e.g. tiling WM workspace switches)
-        if self.ticks.is_multiple_of(RECHECK_TICKS) {
+        if self.ticks.is_multiple_of((RECHECK_MS / self.period.max(1)).max(1)) {
             self.refresh(false);
+            // plugged in or unplugged: change the pulse rate
+            let period = pulse_period();
+            if period != self.period && self.animating {
+                self.period = period;
+                unsafe {
+                    SetTimer(Some(self.host), TIMER_PULSE, period, None);
+                }
+            }
         }
         if self.drawn.is_none() || !self.mode.animated() {
             return;
@@ -562,6 +594,7 @@ impl Glow {
         self.locked = locked.unwrap_or(self.locked);
         self.display_off = display_off.unwrap_or(self.display_off);
         let now = self.locked || self.display_off;
+        UNSEEN.store(now, std::sync::atomic::Ordering::Relaxed);
         if was && !now {
             self.refresh(false);
         }
@@ -914,6 +947,7 @@ fn glow_thread(
                 target_hooks: Vec::new(),
                 global_hooks,
                 animating: false,
+                period: TICK_MS,
                 ticks: 0,
                 start: Instant::now(),
                 own_pid,
@@ -1052,9 +1086,8 @@ mod tests {
 
     #[test]
     fn pulse_timer_only_when_seen() {
-        // ~12 fps, re-check every ~0.5 s
-        assert!((80..=90).contains(&TICK_MS));
-        assert!((450..=550).contains(&(TICK_MS * RECHECK_TICKS)));
+        // ~30 fps, re-check every ~0.5 s
+        assert!((30..=40).contains(&TICK_MS));
         for m in [Mode::Breath, Mode::Heartbeat] {
             assert!(wants_timer(m, true, false, false));
             assert!(!wants_timer(m, false, false, false)); // nothing drawn
