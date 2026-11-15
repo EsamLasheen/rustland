@@ -6,8 +6,10 @@
 //! click-through window at the bottom of the z-order with the blurred wallpaper, so what shows
 //! through looks like frosted glass. DWM cannot do it for other programs' windows: measured on
 //! 2026-11-06, SetWindowCompositionAttribute (blur, acrylic) and DWMWA_SYSTEMBACKDROP_TYPE all report
-//! success on a foreign window and change no pixel. Another window behind a glass one therefore
-//! shows through sharp; only the wallpaper is blurred, and desktop icons are covered meanwhile.
+//! success on a foreign window and change no pixel. Another window behind a glass one would
+//! therefore show through sharp, its text mixed into the text in front; so a glass window that lies
+//! over part of another program's window turns opaque until it is clear of it again. Glass only
+//! ever shows the blurred wallpaper. Desktop icons are covered while the pane shows.
 //!
 //! Changing another program's window style waits on that program's thread, so everything runs on
 //! one thread of its own: a hung app can stall this feature but nothing else.
@@ -15,11 +17,12 @@
 //! Left alone: our own windows, excluded programs, fullscreen windows (games and video keep their
 //! direct path to the screen; they get the effect back when they leave fullscreen), windows that
 //! are already layered by their own app, and elevated windows (Windows refuses the change).
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use windows::core::BOOL;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -166,10 +169,63 @@ unsafe fn opaque_layered(h: HWND) -> bool {
     our_alpha(h, 255)
 }
 
+/// Visible frame of a window (without the invisible resize borders, which overlap neighbours).
+unsafe fn bounds(h: HWND) -> Option<RECT> {
+    let mut r = RECT::default();
+    if DwmGetWindowAttribute(
+        h,
+        DWMWA_EXTENDED_FRAME_BOUNDS,
+        &mut r as *mut RECT as *mut _,
+        std::mem::size_of::<RECT>() as u32,
+    )
+    .is_err()
+    {
+        GetWindowRect(h, &mut r).ok()?;
+    }
+    Some(r)
+}
+
+/// Overlap of two rectangles larger than a sliver in both directions (snapped neighbours touch).
+fn overlaps(a: &RECT, b: &RECT) -> bool {
+    a.right.min(b.right) - a.left.max(b.left) > 8 && a.bottom.min(b.bottom) - a.top.max(b.top) > 8
+}
+
+/// Another program's window lies under part of this one: its text would show through.
+unsafe fn over_another(h: HWND) -> bool {
+    let Some(r) = bounds(h) else {
+        return false;
+    };
+    let own = std::process::id();
+    let mut next = GetWindow(h, GW_HWNDNEXT);
+    for _ in 0..1024 {
+        let Ok(w) = next else {
+            break;
+        };
+        if w.is_invalid() {
+            break;
+        }
+        let mut pid = 0;
+        GetWindowThreadProcessId(w, Some(&mut pid));
+        if pid != own
+            && crate::shell::is_app_window(w)
+            && !IsIconic(w).as_bool()
+            && bounds(w).is_some_and(|q| overlaps(&r, &q))
+        {
+            return true;
+        }
+        next = GetWindow(w, GW_HWNDNEXT);
+    }
+    false
+}
+
 #[derive(Default)]
 struct Engine {
     /// Windows we made translucent.
     tracked: HashSet<isize>,
+    /// Alpha last set on each tracked window (the glass value, or opaque while over another).
+    shown: HashMap<isize, u8>,
+    /// Pending thread timer that re-checks overlaps after windows moved (0: none).
+    restack_timer: usize,
     /// Tracked windows that went fullscreen and were made opaque for it.
     fullscreen: HashSet<isize>,
     /// Tracked windows that were layered before us: they keep the style when given back.
@@ -185,8 +241,42 @@ impl Engine {
         self.settings.as_ref().filter(|s| s.enabled)
     }
 
+    /// Glass, or opaque while over another program's window; set only when it changes.
+    unsafe fn apply_alpha(&mut self, h: HWND, key: isize, glass: u8) -> bool {
+        let a = if glass < 255 && over_another(h) { 255 } else { glass };
+        if self.shown.get(&key) == Some(&a) {
+            return true;
+        }
+        let ok = SetLayeredWindowAttributes(h, COLORREF(0), a, LWA_ALPHA).is_ok();
+        if ok {
+            self.shown.insert(key, a);
+        }
+        ok
+    }
+
+    /// Windows moved or changed order: which glass windows now lie over another one?
+    unsafe fn restack(&mut self) {
+        let Some(glass) = self.on().map(|s| s.alpha) else {
+            return;
+        };
+        for key in self.tracked.iter().copied().collect::<Vec<_>>() {
+            let h = HWND(key as *mut _);
+            if IsWindow(Some(h)).as_bool() && !IsHungAppWindow(h).as_bool() {
+                self.apply_alpha(h, key, glass);
+            }
+        }
+    }
+
+    /// Re-check overlaps shortly: moves arrive dozens a second while a window is dragged.
+    unsafe fn schedule_restack(&mut self) {
+        if self.restack_timer == 0 {
+            self.restack_timer = SetTimer(None, 0, 40, None);
+        }
+    }
+
     unsafe fn give_back(&mut self, key: isize) {
         let h = HWND(key as *mut _);
+        self.shown.remove(&key);
         let strip = !self.app_layered.remove(&key);
         if self.tracked.remove(&key) && IsWindow(Some(h)).as_bool() && !IsHungAppWindow(h).as_bool() {
             clear(h, strip);
@@ -222,7 +312,7 @@ impl Engine {
             if self.tracked.insert(key) {
                 self.app_layered.insert(key);
             }
-            let _ = SetLayeredWindowAttributes(h, COLORREF(0), s.alpha, LWA_ALPHA);
+            self.apply_alpha(h, key, s.alpha);
             return;
         }
         if ex & WS_EX_LAYERED.0 != 0 {
@@ -232,10 +322,11 @@ impl Engine {
             self.app_layered.insert(key);
         }
         SetWindowLongW(h, GWL_EXSTYLE, (ex | WS_EX_LAYERED.0) as i32);
-        if SetLayeredWindowAttributes(h, COLORREF(0), s.alpha, LWA_ALPHA).is_ok()
-            && GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_LAYERED.0 != 0
-        {
+        self.shown.remove(&key);
+        if self.apply_alpha(h, key, s.alpha) && GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_LAYERED.0 != 0 {
             self.tracked.insert(key);
+        } else {
+            self.shown.remove(&key);
         }
     }
 
@@ -268,6 +359,7 @@ impl Engine {
                 for h in top_level_windows() {
                     self.consider(h);
                 }
+                self.restack();
             }
             None => {
                 for key in self.tracked.iter().copied().collect::<Vec<_>>() {
@@ -304,19 +396,32 @@ unsafe extern "system" fn on_event(
         match event {
             EVENT_OBJECT_DESTROY => {
                 e.tracked.remove(&key);
+                e.shown.remove(&key);
                 e.fullscreen.remove(&key);
                 e.app_layered.remove(&key);
+                e.schedule_restack();
             }
-            // moves fire constantly: only a change of fullscreen state on a known window matters
+            // moves fire constantly: fullscreen changes are handled now, overlaps a moment later
             EVENT_OBJECT_LOCATIONCHANGE => {
+                if GetAncestor(h, GA_ROOT) != h {
+                    return;
+                }
                 let full = crate::wm::covers_monitor(h);
                 if (full && e.tracked.contains(&key)) || (!full && e.fullscreen.contains(&key)) {
                     e.consider(h);
                 } else {
-                    return; // the common case: nothing changed
+                    if e.tracked.contains(&key) || crate::shell::is_app_window(h) {
+                        e.schedule_restack();
+                    }
+                    return; // the common case: no fullscreen change
                 }
             }
-            _ => e.consider(h),
+            _ => {
+                e.consider(h);
+                e.restack();
+                // z-order can settle after the event (activation, restore animation)
+                e.schedule_restack();
+            }
         }
         e.sync_frost();
     });
@@ -352,6 +457,16 @@ fn run() {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if msg.message == WM_RECONFIGURE {
                 apply();
+            } else if msg.message == WM_TIMER && msg.hwnd.is_invalid() {
+                let _ = KillTimer(None, msg.wParam.0);
+                ENGINE.with(|e| {
+                    if let Ok(mut e) = e.try_borrow_mut() {
+                        if e.restack_timer == msg.wParam.0 {
+                            e.restack_timer = 0;
+                        }
+                        e.restack();
+                    }
+                });
             } else {
                 DispatchMessageW(&msg);
             }
@@ -369,6 +484,14 @@ mod tests {
         assert_eq!(alpha_of(0.1), 153);
         assert_eq!(alpha_of(3.), 255);
         assert_eq!(alpha_of(f32::NAN), 255);
+    }
+
+    #[test]
+    fn touching_neighbours_do_not_overlap() {
+        let r = |l, t, rr, b| RECT { left: l, top: t, right: rr, bottom: b };
+        assert!(overlaps(&r(0, 0, 500, 500), &r(300, 300, 900, 900)));
+        assert!(!overlaps(&r(0, 0, 500, 500), &r(495, 0, 1000, 500))); // snapped side by side
+        assert!(!overlaps(&r(0, 0, 500, 500), &r(600, 0, 1000, 500)));
     }
 
     #[test]

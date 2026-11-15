@@ -29,6 +29,8 @@ pub enum Act {
     Reload,
     Sleep,
     Capture,
+    /// Step aside: plain Windows until resumed (see `supervisor.rs`).
+    Pause,
 }
 
 pub struct Binding {
@@ -170,6 +172,7 @@ pub const BINDINGS: &[Binding] = &[
     b!(WIN | ALT, 0x52, "Win+Alt+R", Reload),
     b!(WIN | ALT, 0x53, "Win+Alt+S", Sleep),
     b!(WIN | SHIFT, 0x41, "Win+Shift+A", Capture),
+    b!(WIN | ALT, 0x24, "Win+Alt+Home", Pause),
 ];
 
 pub fn find(mods: u8, key: u16) -> Option<&'static Binding> {
@@ -188,6 +191,7 @@ pub fn to_cmd(a: Act) -> Cmd {
         Reload => Cmd::Reload,
         Sleep => Cmd::Sleep,
         Capture => Cmd::Capture,
+        Pause => Cmd::Pause,
     }
 }
 
@@ -554,7 +558,7 @@ mod tests {
     use super::*;
     #[test]
     fn full_legacy_table_without_duplicates() {
-        assert_eq!(BINDINGS.len(), 63);
+        assert_eq!(BINDINGS.len(), 64);
         for (i, a) in BINDINGS.iter().enumerate() {
             for b in &BINDINGS[i + 1..] {
                 assert!(

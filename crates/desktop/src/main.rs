@@ -68,7 +68,11 @@ fn main() {
         Some("--feature-audit") => feature_audit(args.get(1)),
         Some("--appbar") => runtime::appbar_helper(args.get(1), args.get(2), args.get(3)),
         Some("--shell") => supervisor::run(),
-        Some("--shell-child") => runtime::run(),
+        Some("--shell-child") => runtime::run().map(|()| {
+            if runtime::pause_requested() {
+                std::process::exit(supervisor::PAUSE_EXIT);
+            }
+        }),
         Some("--render") => render_snapshot(args.get(1), args.get(2), args.get(3)),
         Some("--palette") => print_palette(args.get(1), args.get(2)),
         Some("--preview") if args.get(1).map(String::as_str) == Some("topbar") => {

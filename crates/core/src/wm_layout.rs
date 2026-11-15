@@ -16,6 +16,8 @@ pub const SPECIAL: usize = 10;
 pub const NAMES: [&str; WORKSPACES] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "S"];
 /// Rule-placed new windows are not followed during this period after start.
 pub const FOLLOW_GRACE: Duration = Duration::from_secs(90);
+/// Smallest tile (visual px) a new window is put in; a smaller one sends it to an empty workspace.
+pub const MIN_TILE: (i32, i32) = (400, 300);
 /// Upper bound on managed windows; further windows are left alone.
 pub const MAX_WINDOWS: usize = 512;
 /// Upper bound on journal entries (also bounds the on-disk file).
@@ -1233,7 +1235,7 @@ impl Model {
         let mon = w.monitor.min(self.monitors.len() - 1);
         let active = self.monitors[mon].active;
         let explicit = w.workspace.filter(|ws| *ws < WORKSPACES);
-        let ws = explicit
+        let mut ws = explicit
             .or_else(|| rule_workspace(w.exe, w.title))
             .unwrap_or(active);
         self.windows.insert(
@@ -1250,16 +1252,45 @@ impl Model {
             },
         );
         self.attach(w.id, mon, ws, None);
+        // No room left: halving tiles forever gives windows smaller than they can be, which
+        // then spill over their neighbours. The new window opens on an empty workspace instead.
+        let mut overflow = false;
+        if !w.floating && explicit.is_none() && self.too_crowded(mon, ws) {
+            if let Some(free) = self.empty_workspace(mon, ws) {
+                self.detach(w.id);
+                self.attach(w.id, mon, free, None);
+                overflow = ws == active;
+                ws = free;
+            }
+        }
         if ws == active {
             self.focused_monitor = mon;
             self.retile_monitor(mon, out);
-        } else if explicit.is_some() || should_follow(since_start, self.config.follow_grace) {
+        } else if overflow
+            || explicit.is_some()
+            || should_follow(since_start, self.config.follow_grace)
+        {
             self.switch_workspace(mon, ws, out);
         } else {
             self.hide(w.id, out);
         }
         out.push(Effect::BarChanged);
         true
+    }
+
+    /// Some tile of the workspace is smaller than a window can usefully be.
+    fn too_crowded(&self, mon: usize, ws: usize) -> bool {
+        let tiles = self.layout_of(mon, ws);
+        tiles.len() > 1
+            && tiles
+                .iter()
+                .any(|(_, r)| r.width < MIN_TILE.0 || r.height < MIN_TILE.1)
+    }
+
+    /// First workspace of the monitor without windows, other than `not` and "S".
+    fn empty_workspace(&self, mon: usize, not: usize) -> Option<usize> {
+        let m = self.monitors.get(mon)?;
+        (0..SPECIAL).find(|&i| i != not && m.workspaces[i].members.is_empty())
     }
 
     pub fn unmanage(&mut self, id: WinId, out: &mut Vec<Effect>) -> bool {
@@ -2251,6 +2282,22 @@ mod tests {
         assert!(m.unmanage(1, &mut out));
         assert!(!m.journal().contains(1));
         assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn crowded_workspace_sends_new_window_to_an_empty_one() {
+        let mut m = model();
+        let mut out = vec![];
+        for id in 1..=12 {
+            m.manage(nw(id, "notepad.exe"), LATE, &mut out);
+        }
+        for (mon, ws) in [(0, 0), (0, 1), (0, 2)] {
+            for (_, r) in m.layout_of(mon, ws) {
+                assert!(r.width >= MIN_TILE.0 && r.height >= MIN_TILE.1, "{ws}: {r:?}");
+            }
+        }
+        assert!(m.layout_of(0, 0).len() >= 3, "a workspace still holds several windows");
+        assert_ne!(m.window(12).map(|w| w.workspace), Some(0));
     }
 
     #[test]

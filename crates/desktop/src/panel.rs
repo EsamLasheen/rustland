@@ -1946,7 +1946,9 @@ fn todo(ui: &mut Ui) {
 fn power(ui: &mut Ui) {
     let s = ui.s;
     let t = *ui.t;
-    let items: [(&str, &str, &str, bool); 6] = [
+    let items: [(&str, &str, &str, bool); 8] = [
+        ("classic", "app", "PLAIN WINDOWS", false),
+        ("reload", "restart", "RELOAD", false),
         ("lock", "lock", "LOCK", false),
         ("sleep", "moon", "SLEEP", false),
         ("hibernate", "hibernate", "HIBERNATE", false),
@@ -2001,9 +2003,9 @@ fn power(ui: &mut Ui) {
         );
         ui.hit(r, Hit::Power(act));
     }
-    ui.y += 300.;
+    ui.y += items.len().div_ceil(2) as f32 * 100.;
     ui.c.text(
-        "Sign out / restart / shut down need a second click.",
+        "Plain Windows: Win+Alt+Home or the tray icon brings RustLand back. Sign out / restart / shut down need a second click.",
         Rect::new(ui.x, ui.y, ui.w, 20.),
         &theme::body(11.5, 400),
         t.muted,

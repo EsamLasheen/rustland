@@ -35,6 +35,7 @@ fn describe(a: Act) -> String {
         Act::Reload => "reload settings".into(),
         Act::Sleep => "sleep".into(),
         Act::Capture => "Gemini screenshot".into(),
+        Act::Pause => "plain Windows (Win+Alt+Home again to come back)".into(),
     }
 }
 

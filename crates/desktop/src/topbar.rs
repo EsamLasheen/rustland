@@ -19,6 +19,20 @@ pub struct TrayIcon {
     pub icon: Option<Image>,
 }
 
+/// Same icons, tooltips and pictures (programs re-send unchanged icons all the time).
+pub fn same_tray(a: &[TrayIcon], b: &[TrayIcon]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.id == y.id
+                && x.tooltip == y.tooltip
+                && match (&x.icon, &y.icon) {
+                    (Some(p), Some(q)) => p.w == q.w && p.h == q.h && p.rgba == q.rgba,
+                    (None, None) => true,
+                    _ => false,
+                }
+        })
+}
+
 #[derive(Clone, Default)]
 pub struct Workspace {
     pub name: String,

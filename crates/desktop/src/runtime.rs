@@ -116,6 +116,8 @@ pub enum Cmd {
     Wm(String),
     Sleep,
     Capture,
+    /// Leave the desktop to plain Windows until the user resumes (supervisor waits meanwhile).
+    Pause,
 }
 
 struct Anim {
@@ -1061,6 +1063,7 @@ pub fn run_cmd(cmd: Cmd) {
         }
         Cmd::Wm(action) => crate::wm_bridge::action(&action),
         Cmd::Sleep => crate::wm_bridge::power("sleep"),
+        Cmd::Pause => pause(),
         Cmd::Capture => {
             let hide =
                 with(|s| subsystems::ai_hit(&panel::Hit::AiCapture, &mut s.pn)).unwrap_or(false);
@@ -1538,6 +1541,15 @@ fn on_panel_hit(hit: panel::Hit, x: f32) {
                 s.clipboard.items.clear();
                 s.pn.clipboard.clear();
             });
+        }
+        H::Power("classic") => {
+            close_panel();
+            pause();
+        }
+        H::Power("reload") => {
+            with(|s| s.pn.armed = None);
+            close_panel();
+            reload_config();
         }
         H::Power(act) => {
             let needs = matches!(act, "logout" | "restart" | "shutdown");
@@ -2228,7 +2240,7 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
             if reopen { open_panel(Tab::Ai); } else if with(|s| s.pn.tab == Some(Tab::Ai)).unwrap_or(false) { paint(Role::Panel); }
             LRESULT(0)
         }
-        subsystems::WM_TRAY => { with(|s| s.top.tray = subsystems::tray_icons()); invalidate_bar(); LRESULT(0) }
+        subsystems::WM_TRAY => { if with(|s| { let next = subsystems::tray_icons(); let same = topbar::same_tray(&s.top.tray, &next); s.top.tray = next; !same }).unwrap_or(true) { invalidate_bar(); } LRESULT(0) }
         WM_METRICS => { ensure_reserved(); health_tick(); hooks_watch(); with(refresh_metrics); if with(|s| s.pn.tab == Some(Tab::Monitoring) && s.panel_slide > 0.).unwrap_or(false) { subsystems::send(sysctl::Command::SampleProcesses); } paint(Role::Bar); if with(|s| s.pn.tab == Some(Tab::Monitoring) || s.pn.tab == Some(Tab::Network)).unwrap_or(false) { paint(Role::Panel); }; LRESULT(0) }
         subsystems::WM_AUDIO_DEVICE => {
             subsystems::audio_device_changed();
@@ -2975,12 +2987,12 @@ pub fn refresh_glass_pane() {
 
 thread_local! { static BAR_DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 /// Data-driven bar updates (tray icons, window title, workspaces, focus) are coalesced: a burst of
-/// events from a noisy program costs one paint, at most ~30 a second. Animations and clicks paint
+/// events from a noisy program costs one paint, at most ~16 a second. Animations and clicks paint
 /// directly.
 fn invalidate_bar() {
     if !BAR_DIRTY.with(|d| d.replace(true)) {
         unsafe {
-            SetTimer(Some(root()), T_BAR_PAINT, 30, None);
+            SetTimer(Some(root()), T_BAR_PAINT, 60, None);
         }
     }
 }
@@ -3167,13 +3179,81 @@ fn hooks_watch() {
     }
     w.event = event;
     w.input = input;
+    let (fg_exe, fg_elevated) = foreground_process();
+    if fg_elevated {
+        // Windows keeps input for an elevated window (Task Manager, installers, admin tools)
+        // from non-elevated hooks: nothing to repair, shortcuts return with the focus.
+        w.streak = 0;
+    }
     if w.streak >= 3 && w.last.is_none_or(|t| t.elapsed().as_secs() >= w.wait) {
         let soon = w.last.is_some_and(|t| t.elapsed().as_secs() < w.wait * 3);
         w.wait = if soon { (w.wait * 2).min(3600) } else { 60 };
         w.last = Some(Instant::now());
         w.streak = 0;
-        note("input hooks: saw nothing while the system kept getting input, reinstalling");
+        note(&format!(
+            "input hooks: saw nothing while the system kept getting input (foreground: {fg_exe}), reinstalling"
+        ));
         crate::input_hooks::restart();
     }
     WATCH.with(|c| c.set(w));
+}
+
+/// File name of the foreground window's program, and whether it runs elevated.
+fn foreground_process() -> (String, bool) {
+    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let fg = GetForegroundWindow();
+        let mut pid = 0;
+        GetWindowThreadProcessId(fg, Some(&mut pid));
+        if pid == 0 {
+            return ("none".into(), false);
+        }
+        let exe = crate::wm::window_exe(fg, pid);
+        let name = exe.rsplit(['\\', '/']).next().unwrap_or("").to_string();
+        let Ok(p) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            // not even limited access: a protected or elevated process
+            return (name, true);
+        };
+        let mut token = HANDLE::default();
+        let mut elevated = false;
+        if OpenProcessToken(p, TOKEN_QUERY, &mut token).is_ok() {
+            let mut e = TOKEN_ELEVATION::default();
+            let mut len = 0;
+            if GetTokenInformation(
+                token,
+                TokenElevation,
+                Some(&mut e as *mut _ as *mut _),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut len,
+            )
+            .is_ok()
+            {
+                elevated = e.TokenIsElevated != 0;
+            }
+            let _ = CloseHandle(token);
+        }
+        let _ = CloseHandle(p);
+        (name, elevated)
+    }
+}
+
+// ── plain Windows ─────────────────────────────────────────────────────────────────────────────
+
+static PAUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The shell exits the normal way (every window, the taskbar and the work area given back) and
+/// tells the supervisor to wait for the user instead of ending: a tray icon and Win+Alt+Home bring it
+/// back. A restart of the PC starts RustLand as usual.
+fn pause() {
+    note("pause: plain Windows until resumed (tray icon or Win+Alt+Home)");
+    PAUSE.store(true, std::sync::atomic::Ordering::SeqCst);
+    unsafe {
+        let _ = PostMessageW(Some(root()), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// The shell ended because the user asked for plain Windows.
+pub fn pause_requested() -> bool {
+    PAUSE.load(std::sync::atomic::Ordering::SeqCst)
 }

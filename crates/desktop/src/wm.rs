@@ -68,6 +68,11 @@ const REFIT_INTERVAL: Duration = Duration::from_millis(500);
 /// A window may pull itself out of its tile this often per [`SNAP_WINDOW`] before we give up.
 const SNAP_LIMIT: u8 = 4;
 const SNAP_WINDOW: Duration = Duration::from_secs(3);
+/// Timer on the manager window that measures re-placed windows again ([`Engine::recheck`]).
+const RECHECK_TIMER: usize = 1;
+/// A rule-placed window opened this soon after the user's last input was launched by them and
+/// is followed even during the start grace (the shell restarts after a pause, deploy or crash).
+const LAUNCHED_BY_USER_MS: u32 = 8000;
 /// Bounded rounds of effect execution per event (effects may produce effects).
 const FLUSH_ROUNDS: usize = 4;
 const JOURNAL_FILE: &str = "wm-hidden.json";
@@ -328,6 +333,7 @@ enum Event {
     DragUpdate((i32, i32)),
     DragEnd((i32, i32)),
     Display,
+    Recheck,
     Shutdown,
 }
 
@@ -499,6 +505,10 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
         }
         MSG_DRAG_END => dispatch(Event::DragEnd(unpack(w.0 as u64))),
         WM_DISPLAYCHANGE => dispatch(Event::Display),
+        WM_TIMER if w.0 == RECHECK_TIMER => {
+            let _ = KillTimer(Some(h), RECHECK_TIMER);
+            dispatch(Event::Recheck);
+        }
         WM_SETTINGCHANGE if w.0 == SPI_SETWORKAREA.0 as usize => dispatch(Event::Display),
         WM_CLOSE => {
             dispatch(Event::Shutdown);
@@ -878,6 +888,9 @@ struct Engine {
     snaps: HashMap<isize, (Instant, u8)>,
     /// Last min-size re-layout per window (rate limit).
     refit: HashMap<isize, Instant>,
+    /// Windows to measure again shortly: an app that refuses a placement with the same size
+    /// it already has sends no further move event, so waiting for one leaves it off its tile.
+    recheck: Vec<isize>,
     out: Vec<Effect>,
     drag: Option<Drag>,
     movesize: Option<MoveSize>,
@@ -905,6 +918,7 @@ impl Engine {
             pending: HashMap::new(),
             placed: HashMap::new(),
             refit: HashMap::new(),
+            recheck: Vec::new(),
             snaps: HashMap::new(),
             out: Vec::with_capacity(64),
             drag: None,
@@ -928,6 +942,14 @@ impl Engine {
                 Event::DragEnd(pt) => self.drag_end(pt),
                 Event::Display => {
                     self.display();
+                }
+                Event::Recheck => {
+                    for key in std::mem::take(&mut self.recheck) {
+                        let h = hwnd(key);
+                        if IsWindow(Some(h)).as_bool() && !IsIconic(h).as_bool() {
+                            self.check_min_size(h);
+                        }
+                    }
                 }
                 Event::Shutdown => {
                     self.shutdown();
@@ -1130,7 +1152,7 @@ impl Engine {
             },
             // The startup grace keeps login apps from yanking the view to their workspace; a
             // window the user brought to the front (launched or clicked) is always followed.
-            if GetForegroundWindow() == h {
+            if GetForegroundWindow() == h || user_just_acted() {
                 Duration::MAX
             } else {
                 self.started.elapsed()
@@ -1398,6 +1420,10 @@ impl Engine {
         {
             self.snaps.insert(key, (now, 1));
             self.place(h, placed);
+            if !self.recheck.contains(&key) && self.recheck.len() < MAX_WINDOWS {
+                self.recheck.push(key);
+            }
+            let _ = SetTimer(Some(hwnd(WINDOW.load(Ordering::Acquire))), RECHECK_TIMER, 400, None);
             return;
         }
         // A "minimum" that is most of the monitor is a restored size, not a real limit.
@@ -1812,5 +1838,18 @@ impl Drop for Engine {
         if !self.hooks.is_empty() || !self.model.journal().is_empty() {
             unsafe { self.shutdown() };
         }
+    }
+}
+
+/// The user pressed a key or moved the mouse within the last few seconds.
+fn user_just_acted() -> bool {
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    unsafe {
+        GetLastInputInfo(&mut info).as_bool()
+            && windows::Win32::System::SystemInformation::GetTickCount().wrapping_sub(info.dwTime)
+                < LAUNCHED_BY_USER_MS
     }
 }
