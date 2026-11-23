@@ -723,8 +723,21 @@ unsafe extern "system" fn on_event(
     }
     with_glow(|g| match ev {
         EVENT_SYSTEM_FOREGROUND => {
-            if h != g.target && eligible(h, g.own_pid) {
+            // UWP apps (Settings) report their inner CoreWindow: glow around the frame that holds it
+            let root = unsafe { GetAncestor(h, GA_ROOT) };
+            let h = if eligible(h, g.own_pid) || root.is_invalid() { h } else { root };
+            if h == g.target {
+                return;
+            }
+            if eligible(h, g.own_pid) {
                 g.retarget(h);
+            } else if window_pid(h) != g.own_pid {
+                // something else took the foreground (a UWP app we cannot frame, the Start menu, the
+                // lock screen): the old window is behind it now, and topmost strips around it would
+                // be drawn over the window in front
+                g.hide_all();
+                g.unhook_target();
+                g.target = HWND::default();
             }
         }
         EVENT_OBJECT_LOCATIONCHANGE | EVENT_SYSTEM_MOVESIZEEND | EVENT_SYSTEM_MINIMIZEEND
