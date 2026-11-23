@@ -120,7 +120,7 @@ impl BarFx {
             .iter()
             .zip(&next)
             // only a real jump is worth animating: small jitter would repaint every sample
-            .any(|(a, b)| matches!((a, b), (Some(a), Some(b)) if (a - b).abs() >= 8.));
+            .any(|(a, b)| matches!((a, b), (Some(a), Some(b)) if (a - b).abs() >= 12.));
         self.tween = (smooth && moved).then_some(Tween {
             at: now,
             from: shown,
@@ -188,7 +188,9 @@ impl BarFx {
             if quiet || p >= 1. {
                 self.tween = None;
             } else {
-                want(FRAME);
+                // a ring easing to a new value: 30 fps is smooth enough, and on a 144 Hz display
+                // each jump in CPU load would otherwise repaint the whole bar ~50 times
+                want(AMBIENT);
             }
         }
         if quiet {

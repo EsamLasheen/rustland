@@ -1980,7 +1980,18 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                 T_CLOCK => { with(|s| { refresh_clock(s); if unsafe { windows::Win32::System::SystemInformation::GetLocalTime() }.wMinute % 10 == 0 { save_usage(s); }; if s.pn.tab == Some(Tab::Notifications) { sync_alerts(s); } }); arm_clock(h); resize_capsule(); paint(Role::Capsule); }
                 T_CARET => { let on_panel = with(|s| { s.caret_on = !s.caret_on; s.pn.focused_input.is_some() && s.pn.tab.is_some() && s.panel_slide > 0. }).unwrap_or(false); if on_panel { paint(Role::Panel); } else { let _ = KillTimer(Some(h), T_CARET); } }
                 T_CLIP => { let _ = KillTimer(Some(h), T_CLIP); capture_clipboard(h); }
-                T_BAR_FX => { with(arm_bar_fx); paint(Role::Bar); }
+                T_BAR_FX => {
+                    with(arm_bar_fx);
+                    // a whole-bar paint takes ~10 ms: more than ~60 a second (a 144 Hz display) only
+                    // burns CPU on frames nobody can tell apart
+                    thread_local! { static LAST: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) }; }
+                    if LAST.with(|l| l.get()).is_none_or(|t| t.elapsed().as_millis() >= 15) {
+                        LAST.with(|l| l.set(Some(Instant::now())));
+                        paint(Role::Bar);
+                    } else {
+                        invalidate_bar(); // the skipped frame may be an animation's last
+                    }
+                }
                 T_BAR_PAINT => { let _ = KillTimer(Some(h), T_BAR_PAINT); BAR_DIRTY.with(|d| d.set(false)); paint(Role::Bar); }
                 T_RESUME => { let _ = KillTimer(Some(h), T_RESUME); on_resume(); }
                 T_RESERVE_CHECK => { let _ = KillTimer(Some(h), T_RESERVE_CHECK); ensure_reserved(); }
