@@ -56,39 +56,6 @@ pub struct ShellConfig {
     pub window_glass_exclude: Vec<String>,
 }
 
-#[cfg(test)]
-mod recovery_tests {
-    use super::*;
-    fn fixture() -> PathBuf {
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("rustland-config-{}-{stamp}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-    #[test]
-    fn corrupt_settings_restore_last_good_and_remain_writable() {
-        let dir = fixture(); let path = dir.join("shell.json");
-        std::fs::write(&path, b"{broken").unwrap();
-        let mut expected = ShellConfig::default(); expected.user_name = "Recovered".into();
-        std::fs::write(dir.join("shell.previous.json"), serde_json::to_vec(&expected).unwrap()).unwrap();
-        let store = Store::at(path.clone());
-        assert!(store.writable); assert_eq!(store.config, expected);
-        store.save().unwrap();
-        assert_eq!(Store::at(path).config, expected);
-        assert!(std::fs::read_dir(&dir).unwrap().any(|p| p.unwrap().file_name().to_string_lossy().contains("corrupt-")));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-    #[test]
-    fn no_valid_backup_starts_without_changing_desktop() {
-        let dir = fixture(); let path = dir.join("shell.json");
-        std::fs::write(&path, b"invalid").unwrap();
-        let store = Store::at(path.clone());
-        assert!(!store.writable); assert!(!store.config.window_manager); assert!(!store.config.hide_taskbar);
-        assert!(store.save().is_err()); assert_eq!(std::fs::read(path).unwrap(), b"invalid");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-}
-
 impl ShellConfig {
     /// `ui_scale` as used: a hand-edited value can not make the shell unusable.
     pub fn ui_scale_clamped(&self) -> f32 {
@@ -265,5 +232,38 @@ impl Store {
             )
             .map_err(io::Error::other)
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    fn fixture() -> PathBuf {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("rustland-config-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    #[test]
+    fn corrupt_settings_restore_last_good_and_remain_writable() {
+        let dir = fixture(); let path = dir.join("shell.json");
+        std::fs::write(&path, b"{broken").unwrap();
+        let expected = ShellConfig { user_name: "Recovered".into(), ..Default::default() };
+        std::fs::write(dir.join("shell.previous.json"), serde_json::to_vec(&expected).unwrap()).unwrap();
+        let store = Store::at(path.clone());
+        assert!(store.writable); assert_eq!(store.config, expected);
+        store.save().unwrap();
+        assert_eq!(Store::at(path).config, expected);
+        assert!(std::fs::read_dir(&dir).unwrap().any(|p| p.unwrap().file_name().to_string_lossy().contains("corrupt-")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn no_valid_backup_starts_without_changing_desktop() {
+        let dir = fixture(); let path = dir.join("shell.json");
+        std::fs::write(&path, b"invalid").unwrap();
+        let store = Store::at(path.clone());
+        assert!(!store.writable); assert!(!store.config.window_manager); assert!(!store.config.hide_taskbar);
+        assert!(store.save().is_err()); assert_eq!(std::fs::read(path).unwrap(), b"invalid");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -42,7 +42,10 @@ pub fn paths() -> io::Result<Paths> {
 
 /// Explicit opt-in root relative to the executable.
 pub fn portable_root() -> Option<PathBuf> {
+    // The real location: started through a junction (the installed path points at the portable
+    // folder), "<junction>.." would otherwise be the junction's parent, not the app's.
     let exe = std::env::current_exe().ok()?;
+    let exe = exe.canonicalize().unwrap_or(exe);
     let dir = exe.parent()?;
     let value = std::fs::read_to_string(dir.join("portable-root.txt")).ok()?;
     let value = value.trim();

@@ -158,16 +158,189 @@ pub fn gaze(cursor: (f32, f32), center: (f32, f32)) -> (f32, f32) {
     (dx / d, dy / d)
 }
 
+/// What Rasto says, per outfit (see [`crate::topbar::RastoKit`]): each theme gives him a character.
+pub struct Voice {
+    /// Answers to a click, in turn.
+    pub clicks: [&'static str; 4],
+    /// Clicked again soon after.
+    pub annoyed: &'static str,
+    /// Clicked a third time: he walks off.
+    pub storm_off: &'static str,
+    pub battery: &'static str,
+    pub ram: &'static str,
+    pub cpu: &'static str,
+    /// 1-5 a.m.
+    pub night: &'static str,
+}
+
+const VOICES: [Voice; 10] = [
+    // Shadow Monarch: a little king of shadows
+    Voice {
+        clicks: [
+            "راستو: الظلال بتسمع كلامي... وانت كمان",
+            "راستو: الرام دي بقت جيش الظلال بتاعي",
+            "راستو: اركع للتاج الأول وبعدين دوس",
+            "راستو: الويندوز ده مملكتي دلوقتي",
+        ],
+        annoyed: "راستو: محدش بيلمس الملك كده!",
+        storm_off: "راستو: هروح أجمّع جيشي وراجع",
+        battery: "راستو: الظلال بتضعف... البطارية بتموت",
+        ram: "راستو: جيشي أكل الرام كلها، زي ما خططت",
+        cpu: "راستو: المعالج بيحارب لوحده... أنا السبب",
+        night: "راستو: حتى ملك الظل بينام، روح نام",
+    },
+    // Dracula: a tiny vampire
+    Voice {
+        clicks: [
+            "راستو: عايز أشرب من البطارية بتاعتك",
+            "راستو: طفّي النور، الشمس بتضايقني",
+            "راستو: تاباتك هتتحول خفافيش الليلة",
+            "راستو: مصّيت الرام كلها... لذيذة",
+        ],
+        annoyed: "راستو: ابعد إيدك قبل ما أعضّك!",
+        storm_off: "راستو: هطير لتابوتي، سلام",
+        battery: "راستو: البطارية نشفت... شربتها كلها",
+        ram: "راستو: الرام دي آخر عشا ليا",
+        cpu: "راستو: المعالج سخن زي دم جديد",
+        night: "راستو: ده وقتي أنا... بس انت روح نام",
+    },
+    // Catppuccin: a cat that is a villain
+    Voice {
+        clicks: [
+            "راستو: مياو... الجهاز ده بقى بيتي",
+            "راستو: هوقّع كل الأيقونات من على الديسكتوب",
+            "راستو: هات تونة وأسيبلك الرام",
+            "راستو: هنام على الكيبورد بتاعك",
+        ],
+        annoyed: "راستو: هخربشك! بطّل!",
+        storm_off: "راستو: رايح أقعد فوق الدولاب، باي",
+        battery: "راستو: البطارية خلصت، والقطة جعانة",
+        ram: "راستو: الرام دي كرة صوف وأنا لعبت بيها",
+        cpu: "راستو: المعالج دافي... هنام عليه",
+        night: "راستو: القطط بتصحى بالليل، انت لأ... روح نام",
+    },
+    // Nord: cold and wrapped in a scarf
+    Voice {
+        clicks: [
+            "راستو: الجو ساقع... هسرق شوية CPU أتدفّى",
+            "راستو: هجمّد كل البرامج بتاعتك",
+            "راستو: السكارف ده هدية من الشتا",
+            "راستو: كل حاجة هتبقى تلج قريب",
+        ],
+        annoyed: "راستو: إيدك ساقعة! ابعد!",
+        storm_off: "راستو: رايح القطب الشمالي، سلام",
+        battery: "راستو: البطارية اتجمّدت... هتموت",
+        ram: "راستو: الرام اتجمّدت كلها عندي",
+        cpu: "راستو: أخيرًا المعالج دفّاني",
+        night: "راستو: الليل ساقع، ادخل تحت البطانية ونام",
+    },
+    // TokyoNight: a neon hacker
+    Voice {
+        clicks: [
+            "راستو: دخلت السيستم... access granted",
+            "راستو: بهكّر الواي فاي بتاع الجيران",
+            "راستو: الليل والنيون بتوعي",
+            "راستو: هشغّل ماتريكس على شاشتك",
+        ],
+        annoyed: "راستو: firewall! متلمسنيش!",
+        storm_off: "راستو: logging out... هرجع بثغرة جديدة",
+        battery: "راستو: low power... البطارية بتفصل",
+        ram: "راستو: عملت overflow للرام كلها",
+        cpu: "راستو: المعالج بيعمل mining ليا",
+        night: "راستو: الهاكرز بس اللي صاحيين... انت روح نام",
+    },
+    // Gruvbox: retro, with a sprout
+    Voice {
+        clicks: [
+            "راستو: بزرع فيروس... قصدي نبتة",
+            "راستو: الجهاز ده محتاج يتسقى",
+            "راستو: الألوان القديمة أحلى، صح؟",
+            "راستو: الرام دي سماد للنبتة بتاعتي",
+        ],
+        annoyed: "راستو: هتبوّظ النبتة! بطّل!",
+        storm_off: "راستو: رايح الجنينة، سلام",
+        battery: "راستو: البطارية دبلت زي ورقة شجر",
+        ram: "راستو: النبتة شربت الرام كلها",
+        cpu: "راستو: المعالج حامي، النبتة هتنشف",
+        night: "راستو: حتى النباتات بتنام بالليل",
+    },
+    // Rose Pine: a romantic villain
+    Voice {
+        clicks: [
+            "راستو: جبتلك وردة... وخدت الرام",
+            "راستو: شرير، بس رومانسي",
+            "راستو: هكتبلك شعر في التاسك مانجر",
+            "راستو: الوردة دي فيها شوك، زيي",
+        ],
+        annoyed: "راستو: كده بتجرح مشاعري!",
+        storm_off: "راستو: ماشي... بس هفضل فاكرك",
+        battery: "راستو: البطارية دبلانة زي وردة قديمة",
+        ram: "راستو: الرام كلها بقت باقة ورد ليا",
+        cpu: "راستو: المعالج قلبه بيدق بسرعة",
+        night: "راستو: الليل رومانسي، بس روح نام",
+    },
+    // Solarized: a little sun
+    Voice {
+        clicks: [
+            "راستو: أنا شمس الجهاز ده",
+            "راستو: هسخّن البروسيسور شوية",
+            "راستو: نوّرت المكان... حرفيًا",
+            "راستو: هعمل كسوف للشاشة",
+        ],
+        annoyed: "راستو: هتتحرق! ابعد!",
+        storm_off: "راستو: هغرب دلوقتي، أشوفك الصبح",
+        battery: "راستو: الشمس بتغرب... البطارية بتموت",
+        ram: "راستو: الرام سايحة من الحر",
+        cpu: "راستو: المعالج بقى زي الصيف",
+        night: "راستو: الشمس نايمة، وانت كمان نام",
+    },
+    // Oxocarbon: a gentleman with a monocle
+    Voice {
+        clicks: [
+            "راستو: بالمونوكل ده شايف كل ملفاتك",
+            "راستو: عزيزي، الرام دي ملكي من النهارده",
+            "راستو: شرير بدرجة جنتلمان",
+            "راستو: هراجع الهارد بتاعك بعناية",
+        ],
+        annoyed: "راستو: يا أستاذ، ده مش لائق!",
+        storm_off: "راستو: اسمحلي أنسحب بأناقة",
+        battery: "راستو: البطارية في حالة مؤسفة يا عزيزي",
+        ram: "راستو: استوليت على الرام بكل أدب",
+        cpu: "راستو: المعالج مرهق، الأمر مؤسف",
+        night: "راستو: الجنتلمان بينام بدري، اتفضل نام",
+    },
+    // dynamic colours: dressed in the wallpaper
+    Voice {
+        clicks: [
+            "راستو: لبست ألوان خلفيتك... حلو؟",
+            "راستو: النجوم دي بتلف عشاني",
+            "راستو: غيّر الخلفية وشوف هلبس إيه",
+            "راستو: أنا نسخة ليميتد من الخلفية دي",
+        ],
+        annoyed: "راستو: هتبهدل ألواني!",
+        storm_off: "راستو: رايح أدور على خلفية أحلى",
+        battery: "راستو: ألواني بتبهت... البطارية بتموت",
+        ram: "راستو: الرام كلها بقت نجوم بتلف",
+        cpu: "راستو: المعالج بيلمع من السخونية",
+        night: "راستو: النجوم طلعت، يعني وقت النوم",
+    },
+];
+
+/// His lines for the outfit in use.
+pub fn voice(kit: crate::topbar::RastoKit) -> &'static Voice {
+    &VOICES[kit as usize]
+}
+
 /// What he has to say about the machine, if anything. `hour` is local time.
-pub fn remark(cpu: Option<f32>, ram: Option<f32>, battery: Option<(f32, bool)>, hour: u16) -> Option<&'static str> {
+pub fn remark(v: &'static Voice, cpu: Option<f32>, ram: Option<f32>, battery: Option<(f32, bool)>, hour: u16) -> Option<&'static str> {
     if battery.is_some_and(|(p, charging)| p < 15. && !charging) {
-        Some("راستو: البطارية بتموت... الحقها قبل ما أنام")
-    } else if ram.is_some_and(|v| v >= 90.) {
-        Some("راستو: أكلت الرام كلها زي ما قلتلك")
-    } else if cpu.is_some_and(|v| v >= 90.) {
-        Some("راستو: الجهاز بيعرق... أنا السبب طبعًا")
+        Some(v.battery)
+    } else if ram.is_some_and(|r| r >= 90.) {
+        Some(v.ram)
+    } else if cpu.is_some_and(|c| c >= 90.) {
+        Some(v.cpu)
     } else if (1..5).contains(&hour) {
-        Some("راستو: نام بقى، حتى الأشرار بتنام")
+        Some(v.night)
     } else {
         None
     }
@@ -240,9 +413,19 @@ mod tests {
 
     #[test]
     fn remarks_put_the_urgent_ones_first() {
-        assert_eq!(remark(Some(10.), Some(50.), Some((80., true)), 14), None);
-        assert!(remark(Some(95.), Some(95.), Some((10., false)), 3).unwrap().contains("البطارية"));
-        assert!(remark(Some(95.), Some(95.), Some((10., true)), 14).unwrap().contains("الرام"));
-        assert!(remark(None, None, None, 2).unwrap().contains("نام"));
+        for kit in ["ShadowMonarch", "DraculaDark", "NordDark", "OxocarbonDark"] {
+            let v = voice(crate::topbar::RastoKit::of(kit, false));
+            assert_eq!(remark(v, Some(10.), Some(50.), Some((80., true)), 14), None);
+            assert!(remark(v, Some(95.), Some(95.), Some((10., false)), 3).unwrap().contains("البطارية"));
+            assert!(remark(v, Some(95.), Some(95.), Some((10., true)), 14).unwrap().contains("الرام"));
+            assert!(remark(v, None, None, None, 2).unwrap().contains("نام"));
+        }
+    }
+
+    #[test]
+    fn every_outfit_has_its_own_voice() {
+        let firsts: std::collections::HashSet<_> = VOICES.iter().map(|v| v.clicks[0]).collect();
+        assert_eq!(firsts.len(), VOICES.len());
+        assert_eq!(VOICES.len(), crate::topbar::RastoKit::Sparkle as usize + 1);
     }
 }

@@ -30,7 +30,10 @@ const SLIDE_MS: f32 = 240.;
 const TWEEN_MS: f32 = 360.;
 const BLINK_MS: f32 = 180.;
 const BLINK_PERIOD: Duration = Duration::from_secs(6);
-const HOP_MS: f32 = 420.;
+const HOP_MS: f32 = 520.;
+/// Each blink starts a short idle moment (a breath, a tail flick, a look around, a stretch), so he
+/// moves like something alive while an idle bar still sleeps most of the time.
+const LIFE_MS: f32 = 1500.;
 
 #[derive(Default)]
 pub struct BarFx {
@@ -42,6 +45,8 @@ pub struct BarFx {
     tween: Option<Tween>,
     /// The companion is shown (its blink is the only effect that repeats on an idle bar).
     pub pet: bool,
+    /// The companion has a window of his own: his frames repaint that, never the whole bar.
+    pub pet_apart: bool,
     pet_since: Option<Instant>,
     hop: Option<Instant>,
 }
@@ -126,6 +131,47 @@ impl BarFx {
     /// Apply the animation state for `now` to the bar and return the delay until the next frame
     /// (`None`: nothing scheduled). `quiet` (screen unseen, fullscreen app, reduced motion) shows
     /// end states only and schedules nothing.
+    /// The companion's blink, glance, idle moment and hop for `now`; the delay to his next frame.
+    fn pet_into(&mut self, now: Instant, fx: &mut Fx) -> Option<u64> {
+        let mut next: Option<u64> = None;
+        let mut want = |d: u64| next = Some(next.map_or(d, |n| n.min(d)));
+            let since = *self.pet_since.get_or_insert(now);
+            // a glance to the side changes with every blink, so he costs no frames in between
+            let beats = (ms(now.duration_since(since)) / ms(BLINK_PERIOD)) as usize;
+            fx.look = [0., -1., 0., 1.][beats % 4];
+            match repeating(now, since, BLINK_MS, BLINK_PERIOD) {
+                Ok(p) => {
+                    fx.blink = Some(p);
+                    want(AMBIENT);
+                }
+                Err(wait) => want(wait),
+            }
+            match repeating(now, since, LIFE_MS, BLINK_PERIOD) {
+                Ok(p) => {
+                    fx.life = Some(((beats % 4) as u8, p));
+                    want(AMBIENT);
+                }
+                Err(wait) => want(wait),
+            }
+            if let Some(at) = self.hop {
+                let p = ms(now.duration_since(at)) / HOP_MS;
+                if p < 1. {
+                    fx.hop = Some(p);
+                    want(FRAME);
+                } else {
+                    self.hop = None;
+                }
+            }
+        next
+    }
+
+    /// The companion's frame when he is drawn in his own window (see [`BarFx::pet_apart`]).
+    pub fn pet_frame(&mut self, now: Instant) -> (Fx, Option<u64>) {
+        let mut fx = Fx::default();
+        let next = self.pet_into(now, &mut fx);
+        (fx, next)
+    }
+
     pub fn frame(&mut self, now: Instant, top: &mut topbar::State, quiet: bool) -> Option<u64> {
         let mut fx = Fx::default();
         let mut next: Option<u64> = None;
@@ -194,26 +240,9 @@ impl BarFx {
                 Err(wait) => want(wait),
             }
         }
-        if self.pet {
-            let since = *self.pet_since.get_or_insert(now);
-            // a glance to the side changes with every blink, so he costs no frames in between
-            let beats = (ms(now.duration_since(since)) / ms(BLINK_PERIOD)) as usize;
-            fx.look = [0., -1., 0., 1.][beats % 4];
-            match repeating(now, since, BLINK_MS, BLINK_PERIOD) {
-                Ok(p) => {
-                    fx.blink = Some(p);
-                    want(AMBIENT);
-                }
-                Err(wait) => want(wait),
-            }
-            if let Some(at) = self.hop {
-                let p = ms(now.duration_since(at)) / HOP_MS;
-                if p < 1. {
-                    fx.hop = Some(p);
-                    want(FRAME);
-                } else {
-                    self.hop = None;
-                }
+        if self.pet && !self.pet_apart {
+            if let Some(w) = self.pet_into(now, &mut fx) {
+                want(w);
             }
         }
         top.fx = fx;
@@ -292,9 +321,9 @@ mod tests {
         fx.frame(t0, &mut top, false);
         assert!(top.fx.blink.is_some());
         // between blinks the bar sleeps until the next one
-        let wait = fx.frame(t0 + Duration::from_secs(1), &mut top, false).unwrap();
-        assert!(top.fx.blink.is_none());
-        assert_eq!(wait, 5000);
+        let wait = fx.frame(t0 + Duration::from_secs(2), &mut top, false).unwrap();
+        assert!(top.fx.blink.is_none() && top.fx.life.is_none());
+        assert_eq!(wait, 4000);
         let t1 = t0 + Duration::from_secs(2);
         fx.on_pet(t1);
         assert_eq!(fx.frame(t1, &mut top, false), Some(FRAME));

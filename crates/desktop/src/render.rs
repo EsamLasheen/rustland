@@ -481,6 +481,10 @@ impl Canvas {
     pub fn chip(&self, r: Rect, k: Radii, fill: Color, border: Option<Color>) {
         self.fill_round(r, k, fill);
         self.bevel(r, k);
+        if r.h > 8. && r.w > 2. * k.tl.max(k.tr) {
+            let lip = Rect::new(r.x + k.tl.max(2.), r.y + 0.6, r.w - k.tl.max(2.) - k.tr.max(2.), 1.);
+            self.fill_round(lip, Radii::all(0.5), Color::rgba(255, 255, 255, 0.10));
+        }
         if let Some(b) = border {
             self.stroke_round(r, k, b, 1.)
         }

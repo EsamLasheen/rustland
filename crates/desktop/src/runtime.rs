@@ -82,6 +82,12 @@ const T_RASTO_ROAM: usize = 41;
 const T_BAR_PAINT: usize = 42;
 const T_RESERVE_CHECK: usize = 43;
 const T_RESUME: usize = 44;
+/// The pointer has rested at the left edge long enough to mean it: show the side bar.
+const T_EDGE_DWELL: usize = 45;
+/// Rasto's own frames while he sits on the bar (timer on his window).
+const T_PET_FX: usize = 46;
+/// How long the pointer must stay at the left edge before the hidden side bar opens.
+const EDGE_DWELL_MS: u32 = 300;
 /// At most one remark about the machine in this many seconds.
 const RASTO_REMARK_S: u64 = 20 * 60;
 /// Capsule notice arrival effect frames (~0.7 s per notice).
@@ -151,6 +157,8 @@ struct Shell {
     rasto: HWND,
     glass_pane: HWND,
     trip: Option<crate::rasto::Trip>,
+    /// Rasto's window sits over his spot on the bar: (x, y, side) in pixels.
+    rasto_home: Option<(i32, i32, i32)>,
     /// Clicks on Rasto in a row and when the last one was.
     rasto_clicks: (u8, Option<Instant>),
     /// When he last commented on the machine.
@@ -291,6 +299,7 @@ fn paint(role: Role) {
                 let mut hits = vec![];
                 let _ = render::present(h, w, ht, k, |c| hits = topbar::paint(c, wd, &t, st));
                 s.hits_bar = hits;
+                sync_home_rasto(s);
             }
             Role::Left => {
                 let st = &s.lb;
@@ -455,7 +464,7 @@ fn refresh_metrics(s: &mut Shell) {
     }
     if s.store.config.pet && s.rasto_said.elapsed().as_secs() >= RASTO_REMARK_S {
         let hour = unsafe { windows::Win32::System::SystemInformation::GetLocalTime().wHour };
-        if let Some(line) = crate::rasto::remark(s.top.cpu, s.top.ram, s.top.battery, hour) {
+        if let Some(line) = crate::rasto::remark(crate::rasto::voice(topbar::RastoKit::current()), s.top.cpu, s.top.ram, s.top.battery, hour) {
             s.rasto_said = Instant::now();
             rasto_line(line);
         }
@@ -784,12 +793,16 @@ fn apply_config(s: &mut Shell) {
     UI_SCALE.store(c.ui_scale_clamped().to_bits(), std::sync::atomic::Ordering::Relaxed);
     s.top.pet = c.pet;
     s.bar_fx.pet = c.pet;
+    // his animation repaints his own 32-pixel window, not the 1920-pixel bar
+    s.bar_fx.pet_apart = true;
+    s.top.pet_apart = true;
     s.pn.rank = c.rank;
     s.pn.ranks = config::RANKS
         .iter()
         .map(|(r, h)| (*r, Color::hex(h)))
         .collect();
     s.pn.preset = c.preset.clone();
+    topbar::set_rasto_kit(&c.preset, c.dynamic_accent);
     s.pn.rotate_hours = c.rotate_hours;
     s.pn.dynamic_accent = c.dynamic_accent;
     s.pn.reduce_motion = c.reduce_motion;
@@ -1185,12 +1198,8 @@ fn rasto_line(text: &str) {
 /// Rasto answers a click with one of his plans for the machine; keep clicking and he gets annoyed,
 /// then storms off along your windows.
 fn rasto_clicked() {
-    const LINES: [&str; 4] = [
-        "راستو: الويندوز ده بتاعي دلوقتي",
-        "راستو: هاكل الرام كلها... هاهاها",
-        "راستو: متلمسنيش، بخطط لحاجة",
-        "راستو: هقفل كل التابات بتاعتك",
-    ];
+    // his lines change with his outfit (the theme)
+    let v = crate::rasto::voice(topbar::RastoKit::current());
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = with(|s| {
         let recent = s.rasto_clicks.1.is_some_and(|t| t.elapsed().as_secs() < 6);
@@ -1202,15 +1211,15 @@ fn rasto_clicked() {
     .unwrap_or(1);
     match n {
         1 => {
-            let i = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % LINES.len();
-            rasto_line(LINES[i]);
+            let i = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % v.clicks.len();
+            rasto_line(v.clicks[i]);
         }
         2 => {
-            rasto_line("راستو: بطّل تدوس عليا!");
+            rasto_line(v.annoyed);
             paint(Role::Bar);
         }
         _ => {
-            rasto_line("راستو: خلاص زهقت! ماشي من هنا");
+            rasto_line(v.storm_off);
             start_rasto_walk();
         }
     }
@@ -1292,6 +1301,9 @@ fn start_rasto_walk() {
             legs,
         });
         s.top.pet = false;
+        s.rasto_home = None;
+        crate::pacer::stop(s.rasto, T_PET_FX);
+        let _ = KillTimer(Some(s.rasto), T_PET_FX);
         crate::pacer::start(s.bar, T_RASTO_WALK);
         true
     })
@@ -1973,6 +1985,7 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                 T_RESUME => { let _ = KillTimer(Some(h), T_RESUME); on_resume(); }
                 T_RESERVE_CHECK => { let _ = KillTimer(Some(h), T_RESERVE_CHECK); ensure_reserved(); }
                 T_RASTO_WALK => rasto_walk_frame(),
+                T_PET_FX => { with(|s| if s.rasto_home.is_some() { pet_home_frame(s) } else { sync_home_rasto(s) }); }
                 T_RASTO_ROAM => { start_rasto_walk(); arm_rasto_roam(); }
                 T_RIPPLE => {
                     with(|s| {
@@ -2007,6 +2020,16 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                 }
                 T_TEST_EXIT => { report_usage(); let _ = DestroyWindow(h); }
                 T_REQUEST => { let _ = KillTimer(Some(h), T_REQUEST); with(|s| { s.cap.request = None; s.request_until = None; }); resize_capsule(); paint(Role::Capsule); }
+                T_EDGE_DWELL => {
+                    let _ = KillTimer(Some(h), T_EDGE_DWELL);
+                    let mut p = POINT::default();
+                    let _ = GetCursorPos(&mut p);
+                    // still at the edge, and not dragging or selecting (a held button)
+                    let held = [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON].iter().any(|k| GetAsyncKeyState(k.0 as i32) < 0);
+                    if with(|s| s.edge_near).unwrap_or(false) && p.x <= 1 && !held && !fullscreen_app(GetForegroundWindow()) {
+                        show_left(true);
+                    }
+                }
                 T_LEFTBAR_HIDE => { let _ = KillTimer(Some(h), T_LEFTBAR_HIDE); let keep = with(|s| s.edge_near || s.pn.tab.is_some() && s.panel_slide > 0.).unwrap_or(true); if !keep { show_left(false); } }
                 T_ANIM => {
                     match role {
@@ -2286,7 +2309,14 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
         WM_SHELL_EDGE => {
             let near = w.0 != 0;
             with(|s| s.edge_near = near);
-            if near { show_left(true); } else if with(|s| s.pn.tab.is_none()).unwrap_or(true) { schedule_left_hide(); }
+            // Opening at the first touch made the bar pop up whenever the pointer went by on its
+            // way to a window edge or scrollbar: it opens once the pointer rests there instead.
+            if near {
+                if with(|s| s.left_shown).unwrap_or(false) { show_left(true); } else { with(|s| { SetTimer(Some(s.left), T_EDGE_DWELL, EDGE_DWELL_MS, None); }); }
+            } else {
+                with(|s| { let _ = KillTimer(Some(s.left), T_EDGE_DWELL); });
+                if with(|s| s.pn.tab.is_none()).unwrap_or(true) { schedule_left_hide(); }
+            }
             LRESULT(0)
         }
         WM_SHELL_CLICK => {
@@ -2593,6 +2623,9 @@ fn arm_bar_fx(s: &mut Shell) {
             fullscreen_app(GetForegroundWindow())
         };
     let next = s.bar_fx.frame(Instant::now(), &mut s.top, quiet);
+    if s.rasto_home.is_some() {
+        pet_home_frame(s);
+    }
     let bar = s.bar;
     unsafe {
         match next {
@@ -2789,6 +2822,7 @@ pub fn run() -> std::io::Result<()> {
             rasto,
             glass_pane,
             trip: None,
+            rasto_home: None,
             rasto_clicks: (0, None),
             rasto_said: Instant::now(),
             tasks,
@@ -3190,10 +3224,13 @@ fn hooks_watch() {
         w.wait = if soon { (w.wait * 2).min(3600) } else { 60 };
         w.last = Some(Instant::now());
         w.streak = 0;
+        // Usually input the hooks are never shown (touchpad gestures and pen in browsers count as
+        // system input without passing the low-level hooks), so swap in new hooks without the
+        // gap a stop and start would leave: a Win key pressed in that gap would open Start.
         note(&format!(
-            "input hooks: saw nothing while the system kept getting input (foreground: {fg_exe}), reinstalling"
+            "input hooks: saw nothing while the system kept getting input (foreground: {fg_exe}), replacing"
         ));
-        crate::input_hooks::restart();
+        crate::input_hooks::refresh();
     }
     WATCH.with(|c| c.set(w));
 }
@@ -3256,4 +3293,101 @@ fn pause() {
 /// The shell ended because the user asked for plain Windows.
 pub fn pause_requested() -> bool {
     PAUSE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+// ── Rasto at home ────────────────────────────────────────────────────────────────────────────
+
+/// Put Rasto's window over his spot on the bar (after a bar paint), or hide it when he is not
+/// there: out walking, switched off, no room, a fullscreen app or the screen unseen.
+fn sync_home_rasto(s: &mut Shell) {
+    if s.trip.is_some() {
+        return;
+    }
+    let spot = s.hits_bar.iter().find(|(_, h)| *h == topbar::Hit::Pet).map(|(r, _)| *r);
+    let hidden = unsafe {
+        !s.top.pet || s.fs_hidden || crate::glow::unseen() || fullscreen_app(GetForegroundWindow())
+    };
+    let Some(r) = spot.filter(|_| !hidden) else {
+        if s.rasto_home.take().is_some() {
+            unsafe {
+                let _ = ShowWindow(s.rasto, SW_HIDE);
+                crate::pacer::stop(s.rasto, T_PET_FX);
+                // back once the fullscreen app or the locked screen is gone
+                SetTimer(Some(s.rasto), T_PET_FX, 5_000, None);
+            }
+        }
+        return;
+    };
+    let k = scale(s.bar);
+    let mut b = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(s.bar, &mut b);
+    }
+    // in the bar he is drawn at (spot centre, spot top + 5.5); in his window at (16, 8)
+    let side = (32. * k).round() as i32;
+    let x = b.left + ((r.x + r.w / 2. - 16.) * k).round() as i32;
+    let y = b.top + ((r.y + 5.5 - 8.) * k).round() as i32;
+    if s.rasto_home != Some((x, y, side)) {
+        unsafe {
+            // owned by the bar: always drawn above it
+            SetWindowLongPtrW(s.rasto, GWLP_HWNDPARENT, s.bar.0 as isize);
+            let _ = SetWindowPos(s.rasto, Some(HWND_TOPMOST), x, y, side, side, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+        s.rasto_home = Some((x, y, side));
+        pet_home_frame(s);
+    }
+}
+
+/// One frame of Rasto on the bar, in his own window, and the timer for the next one.
+fn pet_home_frame(s: &mut Shell) {
+    let Some((x, y, side)) = s.rasto_home else {
+        return;
+    };
+    let quiet = s.store.config.reduce_motion
+        || crate::glow::unseen()
+        || unsafe { fullscreen_app(GetForegroundWindow()) };
+    if quiet && !s.store.config.reduce_motion {
+        // nobody can see him: hide, look again later
+        sync_home_rasto(s);
+        return;
+    }
+    let (fx, next) = if quiet { (topbar::Fx::default(), None) } else { s.bar_fx.pet_frame(Instant::now()) };
+    let k = scale(s.bar);
+    let center = (x as f32 + side as f32 / 2., y as f32 + side as f32 / 2.);
+    let mut cursor = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut cursor);
+    }
+    let cursor = (cursor.x as f32, cursor.y as f32);
+    // the pointer nearby: he watches it instead of glancing about
+    let near = (cursor.0 - center.0).hypot(cursor.1 - center.1) < 220. * k;
+    let mood = topbar::RastoMood {
+        blink: fx.blink,
+        grin: fx.hop.is_some(),
+        angry: s.top.pet_angry,
+        sweat: s.top.cpu.is_some_and(|v| v >= 85.),
+        gaze: if near { crate::rasto::gaze(cursor, center) } else { (fx.look, 0.) },
+        life: fx.life,
+        hop: fx.hop,
+        ..Default::default()
+    };
+    let t = s.tokens;
+    let _ = render::present(s.rasto, side, side, k, |c| topbar::paint_rasto(c, 16., 8., &t, mood));
+    count_paint(5);
+    unsafe {
+        match next {
+            Some(ms) if ms <= crate::fx::FRAME => {
+                let _ = KillTimer(Some(s.rasto), T_PET_FX);
+                crate::pacer::start(s.rasto, T_PET_FX);
+            }
+            Some(ms) => {
+                crate::pacer::stop(s.rasto, T_PET_FX);
+                SetTimer(Some(s.rasto), T_PET_FX, ms.min(60_000) as u32, None);
+            }
+            None => {
+                crate::pacer::stop(s.rasto, T_PET_FX);
+                let _ = KillTimer(Some(s.rasto), T_PET_FX);
+            }
+        }
+    }
 }
