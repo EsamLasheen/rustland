@@ -340,6 +340,8 @@ struct Glow {
     display_off: bool,
     power_note: Option<HPOWERNOTIFY>,
     session_note: bool,
+    /// Retries left for a foreground window that was not ready (see [`TIMER_RETRY`]).
+    retries: u8,
 }
 
 /// Session locked or display off: nobody can see the screen, so no surface should animate.
@@ -407,6 +409,11 @@ fn with_glow(f: impl FnOnce(&mut Glow)) {
 const WM_APP_CMD: u32 = WM_APP + 0x41;
 const WM_APP_STOP: u32 = WM_APP + 0x42;
 const TIMER_PULSE: usize = 1;
+/// Looks again at a foreground window that was not ready to glow around (just launched, still
+/// hidden or tiny) every 150 ms, for up to 3 s.
+const TIMER_RETRY: usize = 2;
+const RETRY_MS: u32 = 150;
+const RETRIES: u8 = 20;
 
 impl Glow {
     fn current_alpha(&self) -> u8 {
@@ -738,6 +745,11 @@ unsafe extern "system" fn on_event(
                 g.hide_all();
                 g.unhook_target();
                 g.target = HWND::default();
+                // a window that just opened takes the foreground before it is shown: look again
+                g.retries = RETRIES;
+                unsafe {
+                    SetTimer(Some(g.host), TIMER_RETRY, RETRY_MS, None);
+                }
             }
         }
         EVENT_OBJECT_LOCATIONCHANGE | EVENT_SYSTEM_MOVESIZEEND | EVENT_SYSTEM_MINIMIZEEND
@@ -805,6 +817,21 @@ unsafe extern "system" fn host_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
     match msg {
         WM_TIMER if wp.0 == TIMER_PULSE => {
             with_glow(Glow::tick);
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == TIMER_RETRY => {
+            with_glow(|g| {
+                let fg = GetForegroundWindow();
+                let root = GetAncestor(fg, GA_ROOT);
+                let fg = if eligible(fg, g.own_pid) || root.is_invalid() { fg } else { root };
+                g.retries = g.retries.saturating_sub(1);
+                if fg == g.target || eligible(fg, g.own_pid) || g.retries == 0 {
+                    let _ = KillTimer(Some(h), TIMER_RETRY);
+                    if fg != g.target && eligible(fg, g.own_pid) {
+                        g.retarget(fg);
+                    }
+                }
+            });
             LRESULT(0)
         }
         WM_APP_CMD => {
@@ -958,6 +985,7 @@ fn glow_thread(
                 drawn: None,
                 alpha: 255,
                 target_hooks: Vec::new(),
+                retries: 0,
                 global_hooks,
                 animating: false,
                 period: TICK_MS,

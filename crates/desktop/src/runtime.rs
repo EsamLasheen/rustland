@@ -927,6 +927,23 @@ fn open_panel(tab: Tab) {
     paint(Role::Panel);
     paint(Role::Left);
 }
+/// Another app came to the front from the keyboard (Alt+Tab, Win+number, a launcher): the panel
+/// and the capsule card close, as a click outside them would, instead of floating over that app.
+/// (Focus-follows-mouse waits while they are open, so passing windows on the way does not count.)
+fn dismiss_on_switch() {
+    let fg = unsafe { GetForegroundWindow() };
+    if is_own(fg) || !crate::shell::is_app_window(fg) {
+        return;
+    }
+    let (panel_open, cap_open, tab) = with(|s| (s.pn.tab.is_some() && s.lb.open.is_some(), s.cap.expanded, s.cap.tab)).unwrap_or((false, false, None));
+    if panel_open {
+        close_panel();
+    }
+    if cap_open {
+        open_capsule(tab.unwrap_or(capsule::Tab::Weather));
+    }
+}
+
 /// Tell focus-follows-mouse whether a panel or the capsule card is open (it waits meanwhile).
 fn sync_surface_open() {
     let open = with(|s| s.lb.open.is_some() || s.cap.expanded).unwrap_or(false);
@@ -2315,7 +2332,7 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
             paint(Role::Capsule);
             LRESULT(0)
         }
-        WM_SHELL_FG => { with(sync_fullscreen); if with(refresh_window).unwrap_or(false) { invalidate_bar(); } LRESULT(0) }
+        WM_SHELL_FG => { with(sync_fullscreen); dismiss_on_switch(); if with(refresh_window).unwrap_or(false) { invalidate_bar(); } LRESULT(0) }
         crate::wm::WM_STATE_CHANGED => { with(|s| { sync_fullscreen(s); refresh_workspaces(s); refresh_window(s); }); invalidate_bar(); LRESULT(0) }
         WM_SHELL_EDGE => {
             let near = w.0 != 0;
@@ -2611,6 +2628,9 @@ fn sync_fullscreen(s: &mut Shell) {
             s.left_shown = true;
         }
     }
+    // Rasto's window is owned by the bar, but Windows hides owned windows only when the owner is
+    // minimized, not hidden: without this he would float over the fullscreen video or game
+    sync_home_rasto(s);
 }
 
 /// Press feedback in the panel (skipped with reduced motion or nobody watching).
