@@ -72,6 +72,9 @@ fn main() {
             if runtime::pause_requested() {
                 std::process::exit(supervisor::PAUSE_EXIT);
             }
+            if runtime::duplicate() {
+                std::process::exit(supervisor::DUPLICATE_EXIT);
+            }
         }),
         Some("--render") => render_snapshot(args.get(1), args.get(2), args.get(3)),
         Some("--palette") => print_palette(args.get(1), args.get(2)),

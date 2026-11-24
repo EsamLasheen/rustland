@@ -346,6 +346,36 @@ pub fn shell_stop_event() -> Option<HANDLE> {
         windows::Win32::System::Threading::CreateEventW(None, true, false, SHELL_STOP_EVENT).ok()
     }
 }
+/// Held by the supervisor (`--shell`) for as long as it runs.
+pub const SUPERVISOR_MUTEX: &str = r"Local\MonarchNext.Shell";
+/// Held by the shell (`--shell-child`) for as long as it runs.
+pub const SHELL_MUTEX: &str = r"Local\MonarchNext.Surfaces";
+/// Set by a shell that pauses (plain Windows) so a supervisor that adopted it, rather than started
+/// it, knows not to start it again.
+pub const SHELL_PAUSE_EVENT: windows::core::PCWSTR = windows::core::w!("Local\\MonarchNext.Pause");
+
+/// Some process holds the named mutex (the supervisor or the shell is alive).
+pub fn mutex_alive(name: &str) -> bool {
+    let w = wide(name);
+    unsafe {
+        match windows::Win32::System::Threading::OpenMutexW(
+            windows::Win32::System::Threading::SYNCHRONIZATION_SYNCHRONIZE,
+            false,
+            PCWSTR(w.as_ptr()),
+        ) {
+            Ok(h) => {
+                let _ = CloseHandle(h);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+pub fn shell_pause_event() -> Option<HANDLE> {
+    unsafe { windows::Win32::System::Threading::CreateEventW(None, true, false, SHELL_PAUSE_EVENT).ok() }
+}
+
 /// Ask the supervisor not to restart the shell (installer, uninstaller). The handle stays open until
 /// this process exits so the supervisor can observe the signal.
 pub fn signal_shell_stop() {

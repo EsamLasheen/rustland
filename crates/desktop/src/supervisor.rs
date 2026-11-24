@@ -1,6 +1,8 @@
 //! Crash recovery without services or scheduled tasks: `--shell` is a tiny supervisor that runs the
-//! real shell (`--shell-child`) and restarts it if it crashes. A clean exit (user quit, update,
-//! uninstall) ends both. It waits on the child handle, so it costs no CPU and ~1 MB.
+//! real shell (`--shell-child`) and restarts it if it crashes or another program closes it. Only a
+//! stop request (installer, uninstaller, deploy), pause, or the session ending stops it. The shell in
+//! turn restarts a supervisor that was killed, and a new supervisor adopts the running shell. It waits
+//! on the child handle, so it costs no CPU and ~1 MB.
 use std::time::{Duration, Instant};
 use windows::Win32::{
     Foundation::*,
@@ -14,6 +16,8 @@ const WINDOW: Duration = Duration::from_secs(120);
 pub const FATAL_EXIT: i32 = 3;
 /// Exit code of a child that left the desktop to plain Windows on request: wait for the user.
 pub const PAUSE_EXIT: i32 = 4;
+/// Exit code of a child that found a shell already running (adopted instead, see [`adopt`]).
+pub const DUPLICATE_EXIT: i32 = 5;
 
 fn stop_event() -> Option<HANDLE> {
     crate::platform::shell_stop_event()
@@ -30,7 +34,7 @@ fn log(m: &str) {
 }
 
 pub fn run() -> std::io::Result<()> {
-    let Some(_instance) = crate::platform::Instance::named(r"Local\MonarchNext.Shell")? else {
+    let Some(_instance) = crate::platform::Instance::named(crate::platform::SUPERVISOR_MUTEX)? else {
         return Ok(()); // already running
     };
     let exe = std::env::current_exe()?;
@@ -40,14 +44,45 @@ pub fn run() -> std::io::Result<()> {
             let _ = ResetEvent(e);
         }
     }
+    let pause = crate::platform::shell_pause_event();
+    if let Some(e) = pause {
+        unsafe {
+            let _ = ResetEvent(e);
+        }
+    }
     let mut crashes: Vec<Instant> = vec![];
     // slower crash loops (one every 30 s, say) are caught by an hourly budget
     let mut hourly: Vec<Instant> = vec![];
     loop {
+        // a shell that outlived its supervisor (killed by Restart Manager or End task) is adopted:
+        // starting a second one would put two bars on the screen
+        if crate::platform::mutex_alive(crate::platform::SHELL_MUTEX) {
+            match adopt(stop, pause) {
+                Adopted::Stop => return Ok(()),
+                Adopted::Paused => {
+                    log("paused: plain Windows");
+                    if !paused::wait(stop) {
+                        return Ok(());
+                    }
+                    log("resumed");
+                    crashes.clear();
+                }
+                Adopted::Gone => {}
+            }
+            continue;
+        }
         let status = std::process::Command::new(&exe)
             .arg("--shell-child")
             .status()?;
+        if status.code() == Some(DUPLICATE_EXIT) {
+            continue; // one appeared meanwhile: adopt it above
+        }
         if status.code() == Some(PAUSE_EXIT) && !stop_requested(stop) {
+            if let Some(e) = pause {
+                unsafe {
+                    let _ = ResetEvent(e);
+                }
+            }
             log("paused: plain Windows");
             if !paused::wait(stop) {
                 return Ok(());
@@ -114,6 +149,42 @@ pub fn run() -> std::io::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(500 * crashes.len() as u64));
     }
+}
+
+enum Adopted {
+    /// Stop requested or Windows is ending the session.
+    Stop,
+    /// The adopted shell paused for plain Windows.
+    Paused,
+    /// It ended some other way: start a new one.
+    Gone,
+}
+
+/// Wait for a shell this supervisor did not start until it ends, without its exit code.
+fn adopt(stop: Option<HANDLE>, pause: Option<HANDLE>) -> Adopted {
+    log("a shell is already running (its supervisor was gone); watching it");
+    while crate::platform::mutex_alive(crate::platform::SHELL_MUTEX) {
+        match stop {
+            Some(e) => unsafe {
+                if WaitForSingleObject(e, 2000) == WAIT_OBJECT_0 {
+                    return Adopted::Stop;
+                }
+            },
+            None => std::thread::sleep(Duration::from_secs(2)),
+        }
+    }
+    if stop_requested(stop) || unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) } != 0 {
+        return Adopted::Stop;
+    }
+    if pause.is_some_and(|e| unsafe { WaitForSingleObject(e, 0) } == WAIT_OBJECT_0) {
+        if let Some(e) = pause {
+            unsafe {
+                let _ = ResetEvent(e);
+            }
+        }
+        return Adopted::Paused;
+    }
+    Adopted::Gone
 }
 
 /// Plain-Windows mode: the shell is gone, the supervisor keeps a tray icon and the Win+Alt+Home

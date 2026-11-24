@@ -2292,7 +2292,7 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
             LRESULT(0)
         }
         subsystems::WM_TRAY => { if with(|s| { let next = subsystems::tray_icons(); let same = topbar::same_tray(&s.top.tray, &next); s.top.tray = next; !same }).unwrap_or(true) { invalidate_bar(); } LRESULT(0) }
-        WM_METRICS => { ensure_reserved(); health_tick(); hooks_watch(); with(refresh_metrics); if with(|s| s.pn.tab == Some(Tab::Monitoring) && s.panel_slide > 0.).unwrap_or(false) { subsystems::send(sysctl::Command::SampleProcesses); } paint(Role::Bar); if with(|s| s.pn.tab == Some(Tab::Monitoring) || s.pn.tab == Some(Tab::Network)).unwrap_or(false) { paint(Role::Panel); }; LRESULT(0) }
+        WM_METRICS => { ensure_reserved(); health_tick(); hooks_watch(); supervisor_watch(); with(refresh_metrics); if with(|s| s.pn.tab == Some(Tab::Monitoring) && s.panel_slide > 0.).unwrap_or(false) { subsystems::send(sysctl::Command::SampleProcesses); } paint(Role::Bar); if with(|s| s.pn.tab == Some(Tab::Monitoring) || s.pn.tab == Some(Tab::Network)).unwrap_or(false) { paint(Role::Panel); }; LRESULT(0) }
         subsystems::WM_AUDIO_DEVICE => {
             subsystems::audio_device_changed();
             let (v, m) = subsystems::audio_state();
@@ -2725,7 +2725,8 @@ pub fn debug_enabled() -> bool {
 pub fn run() -> std::io::Result<()> {
     let paths = crate::platform::paths()?;
     // one shell per session even when an orphaned child outlived its supervisor
-    let Some(_instance) = crate::platform::Instance::named(r"Local\MonarchNext.Surfaces")? else {
+    let Some(_instance) = crate::platform::Instance::named(crate::platform::SHELL_MUTEX)? else {
+        DUPLICATE.store(true, std::sync::atomic::Ordering::SeqCst);
         return Ok(());
     };
     // a crash must never leave the user without a taskbar or screen space
@@ -3316,6 +3317,12 @@ static PAUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new
 fn pause() {
     note("pause: plain Windows until resumed (tray icon or Win+Alt+Home)");
     PAUSE.store(true, std::sync::atomic::Ordering::SeqCst);
+    // a supervisor that adopted this shell sees no exit code: it reads this instead
+    if let Some(e) = crate::platform::shell_pause_event() {
+        unsafe {
+            let _ = windows::Win32::System::Threading::SetEvent(e);
+        }
+    }
     unsafe {
         let _ = PostMessageW(Some(root()), WM_CLOSE, WPARAM(0), LPARAM(0));
     }
@@ -3324,6 +3331,35 @@ fn pause() {
 /// The shell ended because the user asked for plain Windows.
 pub fn pause_requested() -> bool {
     PAUSE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+static DUPLICATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Another shell was already running, so this one did not start.
+pub fn duplicate() -> bool {
+    DUPLICATE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The supervisor restarts the shell; this restarts the supervisor. If something killed it (Restart
+/// Manager during an app update, End task) a new one is started, and it adopts this shell instead of
+/// starting a second one. Checked at most every 10 s.
+fn supervisor_watch() {
+    thread_local! { static LAST: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) }; }
+    if LAST.with(|l| l.get()).is_some_and(|t| t.elapsed().as_secs() < 10) {
+        return;
+    }
+    LAST.with(|l| l.set(Some(Instant::now())));
+    let leaving = pause_requested()
+        || unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) } != 0
+        || crate::platform::shell_stop_event()
+            .is_some_and(|e| unsafe { windows::Win32::System::Threading::WaitForSingleObject(e, 0) } == WAIT_OBJECT_0);
+    if leaving || crate::platform::mutex_alive(crate::platform::SUPERVISOR_MUTEX) {
+        return;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if std::process::Command::new(exe).arg("--shell").spawn().is_ok() {
+            note("supervisor was gone; started a new one (it adopts this shell)");
+        }
+    }
 }
 
 // ── Rasto at home ────────────────────────────────────────────────────────────────────────────
