@@ -56,12 +56,27 @@ pub fn run() -> std::io::Result<()> {
             crashes.clear();
             continue;
         }
-        // user quit, installer/uninstaller request, or Windows signing out / shutting down
-        if status.success()
-            || stop_requested(stop)
-            || unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) } != 0
-        {
+        // installer/uninstaller/deploy request, or Windows signing out / shutting down
+        if stop_requested(stop) || unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) } != 0 {
             return Ok(());
+        }
+        // A clean exit nobody asked for: another program closed the shell. Restart Manager does
+        // this while an app updates (seen 2026-11-24 during a Claude update: RustLand was closed and
+        // never came back), and so does "End task". The user leaves through pause, sign-out or
+        // shutdown, all handled above, so the shell comes back.
+        if status.success() {
+            let now = Instant::now();
+            hourly.retain(|t| now.duration_since(*t) < Duration::from_secs(3600));
+            hourly.push(now);
+            if hourly.len() >= 10 {
+                return Ok(());
+            }
+            log("shell was closed by another program (not by the user); starting it again");
+            std::thread::sleep(Duration::from_secs(2));
+            if stop_requested(stop) || unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) } != 0 {
+                return Ok(());
+            }
+            continue;
         }
         if status.code() == Some(FATAL_EXIT) {
             let _ = crate::wm::recover();
